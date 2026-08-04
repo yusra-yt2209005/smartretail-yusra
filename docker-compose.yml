@@ -79,6 +79,23 @@ services:
       retries: 10
     restart: unless-stopped
 
+  api:
+    build: .
+    container_name: app-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/code
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   # Temporal (Week 2+): durable workflow engine for the publishing / processing
   # workflow. `auto-setup` starts the server and creates its schema inside the
   # Postgres above (in its own `temporal` / `temporal_visibility` databases).
