@@ -73,7 +73,11 @@ class Product(TimestampMixin, Base):
     )
 
     status: Mapped[ProductStatus] = mapped_column(
-        Enum(ProductStatus, name="product_status"),
+        Enum(
+            ProductStatus,
+            name="product_status",
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
         nullable=False,
         default=ProductStatus.DRAFT,
         index=True,
