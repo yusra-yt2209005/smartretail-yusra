@@ -1,9 +1,37 @@
-from fastapi import FastAPI
-from app.api.v1 import health
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
-app = FastAPI(title="SmartRetail API", version="0.1.0")
+from app.api.v1 import auth, health
+from app.core.exceptions import AppError
+
+
+app = FastAPI(
+    title="SmartRetail API",
+    version="0.1.0",
+)
+
+
+@app.exception_handler(AppError)
+async def handle_app_error(
+    request: Request,
+    exc: AppError,
+) -> JSONResponse:
+    """
+    Convert application/domain errors into a consistent JSON response.
+    """
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.error_code,
+                "message": exc.message,
+            }
+        },
+    )
+
 
 app.include_router(health.router)
+app.include_router(auth.router)
 # from fastapi import FastAPI, Request
 # from fastapi.exceptions import RequestValidationError
 # from fastapi.responses import JSONResponse
