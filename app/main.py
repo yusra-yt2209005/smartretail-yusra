@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api.v1 import auth, health
+from app.api.v1 import auth, categories, health, products
 from app.core.exceptions import AppError
 
 
@@ -32,6 +32,8 @@ async def handle_app_error(
 
 app.include_router(health.router)
 app.include_router(auth.router)
+app.include_router(categories.router)
+app.include_router(products.router)
 # from fastapi import FastAPI, Request
 # from fastapi.exceptions import RequestValidationError
 # from fastapi.responses import JSONResponse

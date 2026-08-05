@@ -96,3 +96,61 @@ def require_role(*allowed_roles: UserRole):
         return current_user
 
     return checker
+
+
+def get_current_user_optional(
+    token: str | None = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+) -> User | None:
+    """
+    Optional authentication for public endpoints.
+
+    If no bearer token is provided:
+        return None
+
+    If a valid token is provided:
+        return the corresponding active User
+
+    If the token is invalid/expired or the user does not exist/is inactive:
+        return None
+
+    This is useful for endpoints like GET /products, where anonymous users
+    are allowed to browse, but logged-in merchants/admins may see more.
+    """
+
+    # No Authorization header at all.
+    # Public access is allowed, so we simply represent the viewer as None.
+    if token is None:
+        return None
+
+    try:
+        # Verify signature + expiration and decode the JWT.
+        payload = decode_access_token(token)
+
+        # JWT "sub" stores our user's UUID as a string.
+        subject = payload.get("sub")
+
+        # A valid user token must contain a string subject.
+        if not isinstance(subject, str):
+            return None
+
+        # Convert the UUID string from the token into a Python UUID object.
+        user_id = uuid.UUID(subject)
+
+    # JWTError:
+    #   invalid signature, expired token, malformed JWT, etc.
+    #
+    # ValueError:
+    #   `sub` existed but was not a valid UUID.
+    except (JWTError, ValueError):
+        return None
+
+    # Load the CURRENT database user rather than trusting only the JWT.
+    user = db.get(User, user_id)
+
+    # Treat nonexistent/deactivated users like anonymous visitors for this
+    # optional dependency.
+    if user is None or not user.is_active:
+        return None
+
+    return user
