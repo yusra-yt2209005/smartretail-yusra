@@ -1,7 +1,5 @@
 """
-Shared pytest fixtures.
 
-Pytest automatically discovers this file.
 
 The fixtures here provide:
 - a FastAPI TestClient
