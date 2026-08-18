@@ -3,6 +3,10 @@ Integration tests for product CRUD, ownership, inventory, and listing.
 """
 
 import uuid
+import pytest
+
+from app.db.session import SessionLocal
+from app.models.product import Product, ProductStatus
 
 
 def create_user_and_token(
@@ -446,3 +450,205 @@ def test_pagination_limit_is_respected(client):
     assert body["limit"] == 2
     assert body["offset"] == 0
     assert len(body["items"]) <= 2
+
+
+
+def create_status_test_product(client) -> tuple[str, str]:
+    """
+    Create a valid draft product and return:
+    (merchant_token, product_id)
+    """
+
+    token = create_user_and_token(
+        client,
+        role="merchant",
+    )
+
+    category_id = create_category(
+        client,
+        token,
+    )
+
+    response = client.post(
+        "/products",
+        json=product_payload(
+            category_id,
+            title=f"TEST-Status-{uuid.uuid4()}",
+            sku=f"TEST-SKU-{uuid.uuid4()}",
+        ),
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    assert response.status_code == 201
+
+    return token, response.json()["id"]
+
+
+def set_product_status_in_db(
+    product_id: str,
+    status: ProductStatus,
+) -> None:
+    """
+    Put a product into a specific lifecycle state for transition tests.
+
+    This bypasses the API intentionally because PUBLISHING and
+    PUBLISH_FAILED will normally be controlled by Temporal in Week 2.
+    """
+
+    with SessionLocal() as db:
+        product = db.get(
+            Product,
+            uuid.UUID(product_id),
+        )
+
+        assert product is not None
+
+        product.status = status
+        db.commit()
+
+
+def test_publish_while_already_publishing_returns_409(client):
+    """
+    A second publish request must not start while publishing is
+    already in progress.
+    """
+
+    token, product_id = create_status_test_product(client)
+
+    set_product_status_in_db(
+        product_id,
+        ProductStatus.PUBLISHING,
+    )
+
+    response = client.post(
+        f"/products/{product_id}/publish",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "conflict"
+
+
+def test_publish_while_already_published_returns_409(client):
+    """
+    A successfully published product cannot be published again.
+    """
+
+    token, product_id = create_status_test_product(client)
+
+    set_product_status_in_db(
+        product_id,
+        ProductStatus.PUBLISHED,
+    )
+
+    response = client.post(
+        f"/products/{product_id}/publish",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "conflict"
+
+
+def test_publish_failed_product_can_retry(client):
+    """
+    PUBLISH_FAILED is a legal entry state for another publish attempt.
+    """
+
+    token, product_id = create_status_test_product(client)
+
+    set_product_status_in_db(
+        product_id,
+        ProductStatus.PUBLISH_FAILED,
+    )
+
+    response = client.post(
+        f"/products/{product_id}/publish",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "published"
+
+
+def test_draft_product_cannot_be_deactivated(client):
+    """
+    Only a published product may be deactivated.
+    """
+
+    token, product_id = create_status_test_product(client)
+
+    response = client.post(
+        f"/products/{product_id}/deactivate",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "conflict"
+
+
+def test_published_product_can_be_deactivated(client):
+    """
+    PUBLISHED -> INACTIVE is a legal transition.
+    """
+
+    token, product_id = create_status_test_product(client)
+
+    set_product_status_in_db(
+        product_id,
+        ProductStatus.PUBLISHED,
+    )
+
+    response = client.post(
+        f"/products/{product_id}/deactivate",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "inactive"
+
+
+@pytest.mark.parametrize(
+    "current_status",
+    [
+        ProductStatus.PUBLISHING,
+        ProductStatus.PUBLISH_FAILED,
+        ProductStatus.INACTIVE,
+    ],
+)
+def test_illegal_deactivate_states_return_409(
+    client,
+    current_status,
+):
+    """
+    Deactivation must reject every state except PUBLISHED.
+    """
+
+    token, product_id = create_status_test_product(client)
+
+    set_product_status_in_db(
+        product_id,
+        current_status,
+    )
+
+    response = client.post(
+        f"/products/{product_id}/deactivate",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "conflict"

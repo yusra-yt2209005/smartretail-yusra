@@ -69,6 +69,40 @@ def _assert_can_edit(
         )
 
 
+# task 2.1
+def _assert_can_publish(product: Product) -> None:
+    """
+    Validate whether a publish action may be started.
+
+    Publishing may start from:
+    - DRAFT: first publish attempt
+    - PUBLISH_FAILED: retry after a failed publish workflow
+    """
+    allowed_statuses = {
+        ProductStatus.DRAFT,
+        ProductStatus.PUBLISH_FAILED,
+    }
+
+    if product.status not in allowed_statuses:
+        raise ConflictError(
+            f"Product cannot be published while status is "
+            f"'{product.status.value}'"
+        )
+
+
+def _assert_can_deactivate(product: Product) -> None:
+    """
+    Only a successfully published product can be deactivated.
+    """
+    if product.status != ProductStatus.PUBLISHED:
+        raise ConflictError(
+            f"Product cannot be deactivated while status is "
+            f"'{product.status.value}'"
+        )
+
+# task 2.1
+
+
 def _validate_category(
     db: Session,
     category_id: uuid.UUID | None,
@@ -201,33 +235,33 @@ def update_product(
     )
 
 
-def set_product_status(
-    db: Session,
-    product_id: uuid.UUID,
-    status: ProductStatus,
-    user: User,
-) -> Product:
-    """
-    Week 1 status transition.
+# def set_product_status(
+#     db: Session,
+#     product_id: uuid.UUID,
+#     status: ProductStatus,
+#     user: User,
+# ) -> Product:
+#     """
+#     Week 1 status transition.
 
-    Week 2 can replace this with a workflow-driven publishing process.
-    """
-    product = get_product(
-        db,
-        product_id,
-    )
+#     Week 2 can replace this with a workflow-driven publishing process.
+#     """
+#     product = get_product(
+#         db,
+#         product_id,
+#     )
 
-    _assert_can_edit(
-        product,
-        user,
-    )
+#     _assert_can_edit(
+#         product,
+#         user,
+#     )
 
-    product.status = status
+#     product.status = status
 
-    db.commit()
-    db.refresh(product)
+#     db.commit()
+#     db.refresh(product)
 
-    return product
+#     return product
 
 
 def update_variant(
@@ -431,6 +465,8 @@ def publish_product(
         user,
     )
 
+    _assert_can_publish(product) # task 2.1 addition: 
+
     errors: list[str] = []
 
     if not product.title.strip():
@@ -459,6 +495,33 @@ def publish_product(
         raise ValidationFailedError(errors)
 
     product.status = ProductStatus.PUBLISHED
+
+    db.commit()
+    db.refresh(product)
+
+    return get_product(
+        db,
+        product.id,
+    )
+
+def deactivate_product(  #2.1
+    db: Session,
+    product_id: uuid.UUID,
+    user: User,
+) -> Product:
+    product = get_product(
+        db,
+        product_id,
+    )
+
+    _assert_can_edit(
+        product,
+        user,
+    )
+
+    _assert_can_deactivate(product)
+
+    product.status = ProductStatus.INACTIVE
 
     db.commit()
     db.refresh(product)

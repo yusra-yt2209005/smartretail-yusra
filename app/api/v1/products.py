@@ -6,7 +6,6 @@ from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_current_user_optional, require_role
 from app.db.session import get_db
-from app.models.product import ProductStatus
 from app.models.user import User, UserRole
 from app.schemas.common import Page
 from app.schemas.product import (
@@ -176,12 +175,12 @@ def deactivate_product(
         )
     ),
 ):
-    return product_service.set_product_status(
+    return product_service.deactivate_product(
         db,
         product_id,
-        ProductStatus.INACTIVE,
         user,
     )
+    
 
 
 @router.delete(
