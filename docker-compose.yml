@@ -89,6 +89,8 @@ services:
       - "8000:8000"
     volumes:
       - .:/code
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
     depends_on:
       postgres:
         condition: service_healthy
