@@ -652,3 +652,94 @@ def test_illegal_deactivate_states_return_409(
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "conflict"
+
+
+def test_cannot_publish_already_published_product(client):
+    """
+    Publishing an already-published product is an illegal
+    product status transition and should return 409.
+    """
+
+    token = create_user_and_token(
+        client,
+        role="merchant",
+    )
+
+    category_id = create_category(
+        client,
+        token,
+    )
+
+    created = client.post(
+        "/products",
+        json=product_payload(
+            category_id,
+            title=f"TEST-Publish-Twice-{uuid.uuid4()}",
+            sku=f"TEST-SKU-{uuid.uuid4()}",
+        ),
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    product_id = created.json()["id"]
+
+    first_publish = client.post(
+        f"/products/{product_id}/publish",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    assert first_publish.status_code == 200
+
+    second_publish = client.post(
+        f"/products/{product_id}/publish",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    assert second_publish.status_code == 409
+    assert second_publish.json()["error"]["code"] == "conflict"
+
+
+def test_cannot_deactivate_draft_product(client):
+    """
+    Only PUBLISHED products can be deactivated.
+    """
+
+    token = create_user_and_token(
+        client,
+        role="merchant",
+    )
+
+    category_id = create_category(
+        client,
+        token,
+    )
+
+    created = client.post(
+        "/products",
+        json=product_payload(
+            category_id,
+            title=f"TEST-Draft-Deactivate-{uuid.uuid4()}",
+            sku=f"TEST-SKU-{uuid.uuid4()}",
+        ),
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    product_id = created.json()["id"]
+
+    # Product is still DRAFT here.
+    response = client.post(
+        f"/products/{product_id}/deactivate",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "conflict"

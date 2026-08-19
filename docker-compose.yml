@@ -94,7 +94,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      temporal:
+        condition: service_started
     restart: unless-stopped
+
 
   # Temporal (Week 2+): durable workflow engine for the publishing / processing
   # workflow. `auto-setup` starts the server and creates its schema inside the
@@ -102,6 +105,7 @@ services:
   # Your app runs a Temporal *worker* (a separate process, like the Celery
   # worker) that hosts your Workflow and Activity code and connects to
   # temporal:7233.
+
   temporal:
     image: temporalio/auto-setup:1.24.2
     container_name: app-temporal
@@ -121,6 +125,7 @@ services:
   # Temporal Web UI: browse workflows, inspect histories, see where a workflow
   # is running, retried or stuck. http://localhost:8233  Your best Temporal
   # debugger — open it before you start guessing.
+
   temporal-ui:
     image: temporalio/ui:2.26.2
     container_name: app-temporal-ui
@@ -131,6 +136,25 @@ services:
     ports:
       - "8233:8080"
     restart: unless-stopped
+
+  temporal-worker:
+    build: .
+    container_name: app-temporal-worker
+    command: python -m app.temporal.worker
+    env_file:
+      - .env
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    volumes:
+      - .:/code
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+
+
 
   # ---------------------------------------------------------------------------
   # Week 3+ services. Started only with:  --profile week3
