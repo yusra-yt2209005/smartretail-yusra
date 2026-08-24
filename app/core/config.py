@@ -12,6 +12,13 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 60
     environment: str = "development"
 
+        # --- Temporal ---
+    temporal_address: str = "temporal:7233"
+    temporal_namespace: str = "default"
+    temporal_task_queue: str = "smartretail-task-queue"
+
+    redis_url: str = "redis://redis:6379/0"
+
 
 # Instantiated once at import time and reused everywhere (a singleton).
 # Creating Settings() is cheap but re-parsing env vars on every request

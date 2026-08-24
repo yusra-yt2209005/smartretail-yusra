@@ -338,6 +338,21 @@ Services should not use FastAPI's `Depends` or import HTTP request objects.
 
 Keeping the service layer independent from FastAPI allows business behavior to be unit-tested without starting the HTTP layer.
 
+
+## Inventory concurrency
+
+Inventory is stored at the product-variant level.
+
+To prevent overselling, inventory reservation uses a single atomic
+conditional PostgreSQL UPDATE:
+
+```sql
+UPDATE product_variants
+SET stock = stock - :qty
+WHERE id = :variant_id
+  AND stock >= :qty
+RETURNING id;
+
 ### `app/api/v1/`
 
 Contains version 1 FastAPI routers.

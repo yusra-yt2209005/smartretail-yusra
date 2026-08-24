@@ -16,7 +16,9 @@ from app.models.product_media import ProductMedia
 from app.models.product_variant import ProductVariant
 from app.models.user import User, UserRole
 from app.schemas.product import ProductCreate, ProductUpdate, VariantUpdate
-
+from app.core.cache import (
+    bump_product_list_cache_version,
+)
 
 def _with_relations(stmt):
     """
@@ -186,6 +188,7 @@ def create_product(
     db.add(product)
     db.commit()
     db.refresh(product)
+    bump_product_list_cache_version()
 
     return get_product(
         db,
@@ -228,40 +231,11 @@ def update_product(
 
     db.commit()
     db.refresh(product)
-
+    bump_product_list_cache_version()
     return get_product(
         db,
         product.id,
     )
-
-
-# def set_product_status(
-#     db: Session,
-#     product_id: uuid.UUID,
-#     status: ProductStatus,
-#     user: User,
-# ) -> Product:
-#     """
-#     Week 1 status transition.
-
-#     Week 2 can replace this with a workflow-driven publishing process.
-#     """
-#     product = get_product(
-#         db,
-#         product_id,
-#     )
-
-#     _assert_can_edit(
-#         product,
-#         user,
-#     )
-
-#     product.status = status
-
-#     db.commit()
-#     db.refresh(product)
-
-#     return product
 
 
 def update_variant(
@@ -308,7 +282,7 @@ def update_variant(
 
     db.commit()
     db.refresh(variant)
-
+    bump_product_list_cache_version()
     return variant
 
 
@@ -329,6 +303,7 @@ def delete_product(
 
     db.delete(product)
     db.commit()
+    bump_product_list_cache_version()
 
 
 def list_products(
@@ -443,17 +418,18 @@ def list_products(
 
     return items, total or 0
 
-
-def publish_product(
+def begin_product_publish(
     db: Session,
     product_id: uuid.UUID,
     user: User,
 ) -> Product:
     """
-    Week 1 synchronous publish validation.
+    Validate the publish entry action and move the product into
+    PUBLISHING before the Temporal workflow is started.
 
-    Week 2 can replace the internal implementation with the Temporal
-    publishing workflow while keeping the API endpoint stable.
+    Legal transitions:
+        DRAFT -> PUBLISHING
+        PUBLISH_FAILED -> PUBLISHING
     """
     product = get_product(
         db,
@@ -465,44 +441,16 @@ def publish_product(
         user,
     )
 
-    _assert_can_publish(product) # task 2.1 addition: 
+    _assert_can_publish(
+        product,
+    )
 
-    errors: list[str] = []
-
-    if not product.title.strip():
-        errors.append("title is required")
-
-    if not product.description.strip():
-        errors.append("description is required")
-
-    if not product.variants:
-        errors.append(
-            "at least one variant is required"
-        )
-
-    for variant in product.variants:
-        if variant.price <= 0:
-            errors.append(
-                f"variant '{variant.sku}' must have a price greater than 0"
-            )
-
-        if variant.stock < 0:
-            errors.append(
-                f"variant '{variant.sku}' cannot have negative stock"
-            )
-
-    if errors:
-        raise ValidationFailedError(errors)
-
-    product.status = ProductStatus.PUBLISHED
+    product.status = ProductStatus.PUBLISHING
 
     db.commit()
     db.refresh(product)
-
-    return get_product(
-        db,
-        product.id,
-    )
+    bump_product_list_cache_version()
+    return product
 
 def deactivate_product(  #2.1
     db: Session,
@@ -525,8 +473,52 @@ def deactivate_product(  #2.1
 
     db.commit()
     db.refresh(product)
-
+    bump_product_list_cache_version()
     return get_product(
         db,
         product.id,
     )
+
+def mark_publish_start_failed(
+    db: Session,
+    product_id: uuid.UUID,
+) -> None:
+    product = db.get(
+        Product,
+        product_id,
+    )
+
+    if product is None:
+        return
+
+    if product.status == ProductStatus.PUBLISHING:
+        product.status = ProductStatus.PUBLISH_FAILED
+
+        db.commit()
+        bump_product_list_cache_version()
+
+
+def get_product_for_publish_status(
+    db: Session,
+    product_id: uuid.UUID,
+    user: User,
+) -> Product:
+    """
+    Return a product after verifying that the user may manage it.
+    """
+    product = get_product(
+        db,
+        product_id,
+    )
+
+    _assert_can_edit(
+        product,
+        user,
+    )
+
+    return product
+
+
+
+
+

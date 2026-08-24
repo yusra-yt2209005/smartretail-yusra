@@ -107,3 +107,9 @@ class Product(TimestampMixin, Base):
         back_populates="product",
         cascade="all, delete-orphan",
     )
+
+    content_chunks: Mapped[list["ContentChunk"]] = relationship(
+    "ContentChunk",
+    back_populates="product",
+    cascade="all, delete-orphan",
+    )

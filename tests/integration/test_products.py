@@ -3,11 +3,80 @@ Integration tests for product CRUD, ownership, inventory, and listing.
 """
 
 import uuid
+
 import pytest
 
+from app.api.v1 import products as products_api
 from app.db.session import SessionLocal
 from app.models.product import Product, ProductStatus
 
+class FakeWorkflowHandle:
+    def __init__(
+        self,
+        workflow_id: str,
+        query_step: str = "processing_media",
+    ):
+        self.id = workflow_id
+        self.query_step = query_step
+
+    async def query(self, *args, **kwargs):
+        return self.query_step
+
+
+class FakeTemporalClient:
+    def __init__(self):
+        self.started_workflows = []
+        self.query_step = "processing_media"
+
+    async def start_workflow(
+        self,
+        workflow,
+        product_id,
+        *,
+        id,
+        task_queue,
+    ):
+        self.started_workflows.append(
+            {
+                "workflow": workflow,
+                "product_id": product_id,
+                "workflow_id": id,
+                "task_queue": task_queue,
+            }
+        )
+
+        return FakeWorkflowHandle(id)
+
+    def get_workflow_handle(
+        self,
+        workflow_id: str,
+    ):
+        return FakeWorkflowHandle(
+            workflow_id,
+            query_step=self.query_step,
+        )
+
+
+@pytest.fixture
+def fake_temporal(monkeypatch):
+    """
+    Replace the real Temporal connection with an in-memory fake.
+
+    API integration tests can therefore verify workflow starting/querying
+    without requiring a running Temporal server.
+    """
+    temporal_client = FakeTemporalClient()
+
+    async def get_fake_temporal_client():
+        return temporal_client
+
+    monkeypatch.setattr(
+        products_api,
+        "get_temporal_client",
+        get_fake_temporal_client,
+    )
+
+    return temporal_client
 
 def create_user_and_token(
     client,
@@ -296,16 +365,10 @@ def test_published_in_stock_product_is_public(client):
 
     product_id = created.json()["id"]
 
-    # Change draft → published.
-    publish = client.post(
-        f"/products/{product_id}/publish",
-        headers={
-            "Authorization": f"Bearer {token}"
-        },
+    set_product_status_in_db(
+        product_id,
+        ProductStatus.PUBLISHED,
     )
-
-    assert publish.status_code == 200
-    assert publish.json()["status"] == "published"
 
     # No Authorization header here: anonymous visitor.
     listing = client.get(
@@ -356,12 +419,9 @@ def test_out_of_stock_product_is_hidden_publicly(client):
     )
 
     product_id = created.json()["id"]
-
-    client.post(
-        f"/products/{product_id}/publish",
-        headers={
-            "Authorization": f"Bearer {token}"
-        },
+    set_product_status_in_db(
+        product_id,
+        ProductStatus.PUBLISHED,
     )
 
     listing = client.get(
@@ -408,11 +468,9 @@ def test_product_price_filter(client):
 
     product_id = created.json()["id"]
 
-    client.post(
-        f"/products/{product_id}/publish",
-        headers={
-            "Authorization": f"Bearer {token}"
-        },
+    set_product_status_in_db(
+        product_id,
+        ProductStatus.PUBLISHED,
     )
 
     response = client.get(
@@ -556,12 +614,18 @@ def test_publish_while_already_published_returns_409(client):
     assert response.json()["error"]["code"] == "conflict"
 
 
-def test_publish_failed_product_can_retry(client):
+def test_publish_failed_product_can_retry(
+    client,
+    fake_temporal,
+):
     """
-    PUBLISH_FAILED is a legal entry state for another publish attempt.
+    PUBLISH_FAILED is a legal state from which another Temporal
+    publishing workflow can be started.
     """
 
-    token, product_id = create_status_test_product(client)
+    token, product_id = create_status_test_product(
+        client
+    )
 
     set_product_status_in_db(
         product_id,
@@ -575,9 +639,136 @@ def test_publish_failed_product_can_retry(client):
         },
     )
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "published"
+    assert response.status_code == 202
 
+    body = response.json()
+
+    assert body["product_id"] == product_id
+    assert body["status"] == "publishing"
+    assert (
+        body["workflow_id"]
+        == f"publish-product-{product_id}"
+    )
+
+    # The API performs the entry transition synchronously.
+    with SessionLocal() as db:
+        product = db.get(
+            Product,
+            uuid.UUID(product_id),
+        )
+
+        assert product is not None
+        assert (
+            product.status
+            == ProductStatus.PUBLISHING
+        )
+
+    # And Temporal was actually asked to start the workflow.
+    assert len(
+        fake_temporal.started_workflows
+    ) == 1
+
+    assert (
+        fake_temporal.started_workflows[0][
+            "product_id"
+        ]
+        == product_id
+    )
+
+def test_publish_starts_temporal_workflow_and_returns_202(
+    client,
+    fake_temporal,
+):
+    """
+    Publishing a DRAFT product should start Temporal asynchronously
+    and immediately return 202 + workflow id.
+    """
+
+    token, product_id = create_status_test_product(
+        client
+    )
+
+    response = client.post(
+        f"/products/{product_id}/publish",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    assert response.status_code == 202
+
+    body = response.json()
+
+    assert body == {
+        "product_id": product_id,
+        "workflow_id": (
+            f"publish-product-{product_id}"
+        ),
+        "status": "publishing",
+    }
+
+    # The API must move DRAFT -> PUBLISHING before returning.
+    with SessionLocal() as db:
+        product = db.get(
+            Product,
+            uuid.UUID(product_id),
+        )
+
+        assert product is not None
+        assert (
+            product.status
+            == ProductStatus.PUBLISHING
+        )
+
+    # Verify start_workflow() was actually called.
+    assert len(
+        fake_temporal.started_workflows
+    ) == 1
+
+    started = fake_temporal.started_workflows[0]
+
+    assert started["product_id"] == product_id
+    assert (
+        started["workflow_id"]
+        == f"publish-product-{product_id}"
+    )
+def test_publish_status_queries_temporal(
+    client,
+    fake_temporal,
+):
+    """
+    /publish-status should return both the durable DB status and
+    Temporal's finer-grained workflow progress.
+    """
+
+    token, product_id = create_status_test_product(
+        client
+    )
+
+    set_product_status_in_db(
+        product_id,
+        ProductStatus.PUBLISHING,
+    )
+
+    fake_temporal.query_step = "processing_media"
+
+    response = client.get(
+        f"/products/{product_id}/publish-status",
+        headers={
+            "Authorization": f"Bearer {token}"
+        },
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["product_id"] == product_id
+    assert body["db_status"] == "publishing"
+    assert (
+        body["workflow_step"]
+        == "processing_media"
+    )
 
 def test_draft_product_cannot_be_deactivated(client):
     """
@@ -654,55 +845,46 @@ def test_illegal_deactivate_states_return_409(
     assert response.json()["error"]["code"] == "conflict"
 
 
-def test_cannot_publish_already_published_product(client):
+def test_second_publish_while_workflow_in_progress_returns_409(
+    client,
+    fake_temporal,
+):
     """
-    Publishing an already-published product is an illegal
-    product status transition and should return 409.
+    Once the first request changes DRAFT -> PUBLISHING, another
+    publish request must immediately receive 409.
     """
 
-    token = create_user_and_token(
-        client,
-        role="merchant",
+    token, product_id = create_status_test_product(
+        client
     )
 
-    category_id = create_category(
-        client,
-        token,
-    )
-
-    created = client.post(
-        "/products",
-        json=product_payload(
-            category_id,
-            title=f"TEST-Publish-Twice-{uuid.uuid4()}",
-            sku=f"TEST-SKU-{uuid.uuid4()}",
-        ),
-        headers={
-            "Authorization": f"Bearer {token}"
-        },
-    )
-
-    product_id = created.json()["id"]
-
-    first_publish = client.post(
+    first = client.post(
         f"/products/{product_id}/publish",
         headers={
             "Authorization": f"Bearer {token}"
         },
     )
 
-    assert first_publish.status_code == 200
+    assert first.status_code == 202
+    assert first.json()["status"] == "publishing"
 
-    second_publish = client.post(
+    second = client.post(
         f"/products/{product_id}/publish",
         headers={
             "Authorization": f"Bearer {token}"
         },
     )
 
-    assert second_publish.status_code == 409
-    assert second_publish.json()["error"]["code"] == "conflict"
+    assert second.status_code == 409
+    assert (
+        second.json()["error"]["code"]
+        == "conflict"
+    )
 
+    # Only the first request should have reached Temporal.
+    assert len(
+        fake_temporal.started_workflows
+    ) == 1
 
 def test_cannot_deactivate_draft_product(client):
     """
