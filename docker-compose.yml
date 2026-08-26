@@ -170,6 +170,23 @@ services:
   #   PLAINTEXT_HOST (localhost:29092) for your laptop / a local script
   # A broker advertises the address clients should use to reach it, which is
   # why one physical broker needs two advertised addresses here.
+
+  celery-worker:
+    build: .
+    container_name: app-celery-worker
+    #command: celery -A app.workers.celery_app.celery_app worker --loglevel=info
+    command: celery -A app.workers.celery_app worker --loglevel=info
+    env_file:
+      - .env
+    volumes:
+      - .:/code
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   kafka:
     image: apache/kafka:3.7.0
     container_name: app-kafka
