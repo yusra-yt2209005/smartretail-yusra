@@ -19,6 +19,9 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://redis:6379/0"
 
+    celery_broker_url: str = "redis://redis:6379/0"
+    celery_result_backend: str = "redis://redis:6379/1"
+
 
 # Instantiated once at import time and reused everywhere (a singleton).
 # Creating Settings() is cheap but re-parsing env vars on every request

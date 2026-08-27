@@ -2,6 +2,7 @@ import hashlib
 import json
 import uuid
 import time
+from datetime import UTC, datetime
 from dataclasses import dataclass
 
 from sqlalchemy import delete, select
@@ -41,6 +42,8 @@ from app.services.payment_service import (
 from app.core.cache import (
     bump_product_list_cache_version,
 )
+
+from app.workers.tasks.notifications import send_order_notification
 
 #ORDER ACTIVTY
 # reserve_inventory_activity
@@ -434,6 +437,8 @@ def mark_product_published_activity(
                 type="InvalidProductState",
                 non_retryable=True,
             )
+        if product.published_at is None:
+            product.published_at = datetime.now(UTC)
 
         product.status = ProductStatus.PUBLISHED
 
@@ -986,20 +991,14 @@ def create_shipment_activity(
 def notify_customer_activity(
     input: OrderIdInput,
 ) -> dict:
-    """
-    Simulated notification.
-
-    Week 3 can later replace the implementation with fire-and-forget
-    background work without changing the saga structure.
-    """
-
-    activity.logger.info(
-        "Notifying customer for order %s (simulated)",
+    send_order_notification.delay(
         input.order_id,
+        "completed",
     )
 
     return {
-        "notified": True
+        "queued": True,
+        "order_id": input.order_id,
     }
 
 

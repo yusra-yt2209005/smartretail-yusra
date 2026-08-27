@@ -187,6 +187,29 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # --- Week 3: Celery Beat ---
+  # Schedules the periodic analytics rollup.
+  celery-beat:
+    build: .
+    container_name: app-celery-beat
+
+    command: celery -A app.workers.celery_app beat --loglevel=info
+
+    env_file:
+      - .env
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
+      postgres:
+        condition: service_healthy
+
+    volumes:
+      - .:/code
+
+    restart: unless-stopped
+
   kafka:
     image: apache/kafka:3.7.0
     container_name: app-kafka

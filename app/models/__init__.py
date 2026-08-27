@@ -28,3 +28,11 @@ from app.services import inventory_service
 from app.services.payment_service import PaymentAuthorizer
 
 
+from app.models.failed_job import FailedJob  # noqa: F401
+from app.models.notification import Notification  # noqa: F401
+
+from app.models.analytics import (
+    AnalyticsDaily,
+    AnalyticsProduct,
+)  # noqa: F401
+

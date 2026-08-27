@@ -1,6 +1,7 @@
 import enum
 import uuid
 from typing import TYPE_CHECKING
+from datetime import datetime
 
 from sqlalchemy import Enum, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import UUID
@@ -14,17 +15,13 @@ if TYPE_CHECKING:
     from app.models.product_media import ProductMedia
     from app.models.product_variant import ProductVariant
     from app.models.user import User
+    from app.models.content_chunk import ContentChunk
 
 
 class ProductStatus(str, enum.Enum):
     """
     Product lifecycle states.
 
-    Week 1 directly uses:
-        DRAFT -> PUBLISHED -> INACTIVE
-
-    Week 2 will use PUBLISHING and PUBLISH_FAILED while Temporal
-    manages the publishing workflow.
     """
 
     DRAFT = "draft"
@@ -81,6 +78,9 @@ class Product(TimestampMixin, Base):
         nullable=False,
         default=ProductStatus.DRAFT,
         index=True,
+    )
+    published_at: Mapped[datetime | None] = mapped_column(
+        nullable=True,
     )
 
     # Python-side ORM relationship to the merchant that owns the product.
