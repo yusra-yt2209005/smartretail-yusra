@@ -2,7 +2,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 
-from app.api.v1 import auth, categories, health, orders, products
+from app.api.v1 import (
+    analytics,
+    auth,
+    categories,
+    health,
+    orders,
+    products,
+)
 from app.core.exceptions import AppError
 
 
@@ -33,6 +40,7 @@ app.include_router(auth.router)
 app.include_router(categories.router)
 app.include_router(products.router)
 app.include_router(orders.router)
+app.include_router(analytics.router)
 
 
 @app.exception_handler(RequestValidationError)
