@@ -1030,7 +1030,7 @@ def create_shipment_activity(
             )
 
             db.add(shipment)
-            qdb.flush()
+            db.flush()
 
         elif (
             shipment.status

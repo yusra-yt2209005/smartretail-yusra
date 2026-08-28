@@ -13,20 +13,68 @@ from app.models.order import Order
 from app.models.order_item import OrderItem
 from app.models.product_variant import ProductVariant
 
+import logging
+import uuid
+
+from sqlalchemy.exc import IntegrityError
+
+from app.models.processed_event import ProcessedEvent
+
+logger = logging.getLogger(__name__)
+
+CONSUMER_NAME = "analytics"
 
 def process_event(
     db: Session,
     envelope: dict,
 ) -> bool:
     """
-    Apply one Kafka event to the analytics aggregates.
+    Apply one Kafka event exactly once for this logical consumer.
 
-    Idempotency is added in task 3.5.
+    Returns:
+        True  -> event was newly applied
+        False -> duplicate event was safely skipped
     """
 
-    event_type = envelope["event_type"]
-    data = envelope["data"]
+    event_id = uuid.UUID(
+        envelope["event_id"]
+    )
 
+    event_type = envelope[
+        "event_type"
+    ]
+
+    data = envelope[
+        "data"
+    ]
+
+    # First claim this event for the analytics consumer.
+    db.add(
+        ProcessedEvent(
+            event_id=event_id,
+            consumer=CONSUMER_NAME,
+        )
+    )
+
+    try:
+        # Forces PostgreSQL to check the composite PK now,
+        # without committing the transaction.
+        db.flush()
+
+    except IntegrityError:
+        # Same event_id + consumer already exists.
+        # Therefore its analytics side effects were already applied.
+        db.rollback()
+
+        logger.info(
+            "Skipping duplicate event %s (%s)",
+            event_id,
+            event_type,
+        )
+
+        return False
+
+    # Only a newly claimed event reaches here.
     if event_type == "product.published":
         _apply_product_published(
             db,
@@ -45,14 +93,9 @@ def process_event(
             data,
         )
 
-    # The remaining events are valid domain events,
-    # but currently do not feed an analytics aggregate:
-    #
-    # order.placed
-    # payment.succeeded
-    # shipment.created
-    # refund.processed
-
+    # Both become durable together:
+    # 1. processed_events marker
+    # 2. analytics updates
     db.commit()
 
     return True

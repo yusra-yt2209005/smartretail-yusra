@@ -6,14 +6,14 @@ from confluent_kafka import Consumer
 
 from app.core.config import settings
 from app.db.session import SessionLocal
-from app.events.handlers import (
-    process_event,
-)
+from app.events.handlers import process_event
+
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,8 +32,8 @@ def build_consumer() -> Consumer:
             ),
             "auto.offset.reset": "earliest",
 
-            # We explicitly commit offsets only
-            # after successful processing.
+            # Kafka should not automatically advance offsets.
+            # We commit only after processing succeeds.
             "enable.auto.commit": False,
         }
     )
@@ -95,20 +95,30 @@ def run() -> None:
                 )
 
                 with SessionLocal() as db:
-                    process_event(
+                    applied = process_event(
                         db,
                         envelope,
                     )
 
-                # Only move Kafka's offset AFTER
-                # database processing succeeded.
+                # A duplicate is still considered successfully handled.
+                #
+                # process_event() returns:
+                # True  -> event was newly applied
+                # False -> event was already processed
+                #
+                # In both cases it is safe to advance the Kafka offset.
                 consumer.commit(
                     message=message,
                     asynchronous=False,
                 )
 
                 logger.info(
-                    "Processed Kafka event %s (%s)",
+                    "%s Kafka event %s (%s)",
+                    (
+                        "Applied"
+                        if applied
+                        else "Skipped duplicate"
+                    ),
                     envelope.get(
                         "event_id"
                     ),
@@ -122,8 +132,11 @@ def run() -> None:
                     "Failed to process Kafka event"
                 )
 
-                # Do NOT commit this message's
-                # offset on processing failure.
+                # IMPORTANT:
+                # Do not commit the Kafka offset here.
+                #
+                # If processing failed, Kafka can redeliver
+                # this message later.
 
     finally:
         consumer.close()

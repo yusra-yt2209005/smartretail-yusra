@@ -38,3 +38,5 @@ from app.models.analytics import (
 
 from app.models.outbox_event import OutboxEvent  # noqa: F401
 
+from app.models.processed_event import ProcessedEvent  # noqa: F401
+
