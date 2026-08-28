@@ -4,7 +4,13 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.models.product_variant import ProductVariant
+from app.core.metrics import (
+    INVENTORY_OVERSELL_PREVENTED_TOTAL,
+)
 
+if reserved_variant_id is None:
+    INVENTORY_OVERSELL_PREVENTED_TOTAL.inc()
+    return False
 
 
 def try_reserve_stock(

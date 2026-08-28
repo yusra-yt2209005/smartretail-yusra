@@ -20,7 +20,10 @@ from sqlalchemy.exc import IntegrityError
 
 from app.models.processed_event import ProcessedEvent
 
-logger = logging.getLogger(__name__)
+
+logger = logging.getLogger(
+    "smartretail.analytics"
+)
 
 CONSUMER_NAME = "analytics"
 
@@ -97,7 +100,11 @@ def process_event(
     # 1. processed_events marker
     # 2. analytics updates
     db.commit()
-
+    logger.info(
+        "Analytics updated from event %s (%s)",
+        event_id,
+        event_type,
+    )
     return True
 
 

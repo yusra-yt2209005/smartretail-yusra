@@ -18,6 +18,11 @@ from app.models.user import User
 from app.schemas.order import OrderCreate
 from app.events.outbox import enqueue
 
+from app.core.correlation import get_correlation_id
+from app.core.metrics import (
+    ORDERS_PLACED_TOTAL,
+)
+
 
 def get_order(
     db: Session,
@@ -220,10 +225,11 @@ def build_order(
             "customer_id": str(order.customer_id),
             "total": str(order.total),
         },
-        correlation_id=f"order-{order.id}",
+        correlation_id=get_correlation_id(),
     )
+    
     db.commit()
-
+    ORDERS_PLACED_TOTAL.inc()
     # Reload items so OrderOut can serialize them.
     return get_order(
         db,

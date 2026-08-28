@@ -19,6 +19,7 @@ from app.temporal.workflows import (
     OrderSagaWorkflow,
 )
 
+from app.core.correlation import get_correlation_id
 
 router = APIRouter(
     prefix="/orders",
@@ -80,6 +81,7 @@ async def create_order(
         OrderSagaInput(
             order_id=str(order.id),
             idempotency_key=idempotency_key,
+            correlation_id=get_correlation_id(),
         ),
         id=workflow_id,
         task_queue=settings.temporal_task_queue,

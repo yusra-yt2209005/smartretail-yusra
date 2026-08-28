@@ -1,7 +1,6 @@
 import hashlib
 import json
 import uuid
-import time
 from datetime import UTC, datetime
 from dataclasses import dataclass
 
@@ -48,6 +47,39 @@ from app.workers.tasks.notifications import send_order_notification
 
 from app.events.outbox import enqueue
 from app.models.product_variant import ProductVariant
+
+
+import logging
+from contextlib import contextmanager
+
+from app.core.correlation import (
+    reset_correlation_id,
+    set_correlation_id,
+)
+
+logger = logging.getLogger(
+    "smartretail.temporal.activities"
+)
+
+
+@contextmanager
+def activity_correlation(
+    correlation_id: str,
+):
+    """
+    Temporarily attach the request correlation ID to this Activity's
+    logging context, then restore the previous context afterwards.
+    """
+    token = set_correlation_id(
+        correlation_id
+    )
+
+    try:
+        yield
+    finally:
+        reset_correlation_id(
+            token
+        )
 
 #ORDER ACTIVTY
 # reserve_inventory_activity
@@ -103,23 +135,28 @@ class MarkFailedInput:
 @dataclass
 class OrderIdInput:
     order_id: str
-
+    correlation_id: str
 
 @dataclass
 class AuthorizePaymentInput:
     order_id: str
     idempotency_key: str
+    correlation_id: str
 
 
 @dataclass
 class PaymentIdInput:
     payment_id: str
+    correlation_id: str
+    
 
 
 @dataclass
 class FailOrderInput:
     order_id: str
     reason: str
+    correlation_id: str
+    
 
 
 # -------------------------------------------------------------------------
@@ -561,167 +598,171 @@ def reserve_inventory_activity(
     an event is recorded only when the reservation succeeds.
     """
 
-    order_id = uuid.UUID(
-        input.order_id
-    )
+    with activity_correlation(
+        input.correlation_id
+    ):
+        logger.info("Reserving inventory for order %s", input.order_id)
 
-    with SessionLocal() as db:
-        order = db.get(
-            Order,
-            order_id,
+
+        order_id = uuid.UUID(
+            input.order_id
         )
 
-        if order is None:
-            raise ApplicationError(
-                f"Order '{order_id}' was not found",
-                type="OrderNotFound",
-                non_retryable=True,
+        with SessionLocal() as db:
+            order = db.get(
+                Order,
+                order_id,
             )
 
-        items = db.scalars(
-            select(OrderItem).where(
-                OrderItem.order_id == order_id
-            )
-        ).all()
-
-        # Combine duplicate variants if the same variant
-        # somehow appears more than once in an order.
-        quantities: dict[uuid.UUID, int] = {}
-
-        for item in items:
-            quantities[item.variant_id] = (
-                quantities.get(
-                    item.variant_id,
-                    0,
-                )
-                + item.qty
-            )
-
-        reserved_count = 0
-
-        for variant_id, qty in quantities.items():
-
-            existing = db.scalar(
-                select(
-                    InventoryReservation
-                ).where(
-                    InventoryReservation.order_id
-                    == order_id,
-                    InventoryReservation.variant_id
-                    == variant_id,
-                )
-            )
-
-            if existing is not None:
-                if (
-                    existing.status
-                    == ReservationStatus.RESERVED
-                ):
-                    reserved_count += 1
-                    continue
-
-                if (
-                    existing.status
-                    == ReservationStatus.COMMITTED
-                ):
-                    reserved_count += 1
-                    continue
-
+            if order is None:
                 raise ApplicationError(
-                    (
-                        "Inventory reservation was already "
-                        "released for variant "
-                        f"'{variant_id}'"
-                    ),
-                    type="ReservationAlreadyReleased",
+                    f"Order '{order_id}' was not found",
+                    type="OrderNotFound",
                     non_retryable=True,
                 )
 
-            reserved = (
-                inventory_service.try_reserve_stock(
+            items = db.scalars(
+                select(OrderItem).where(
+                    OrderItem.order_id == order_id
+                )
+            ).all()
+
+            # Combine duplicate variants if the same variant
+            # somehow appears more than once in an order.
+            quantities: dict[uuid.UUID, int] = {}
+
+            for item in items:
+                quantities[item.variant_id] = (
+                    quantities.get(
+                        item.variant_id,
+                        0,
+                    )
+                    + item.qty
+                )
+
+            reserved_count = 0
+
+            for variant_id, qty in quantities.items():
+
+                existing = db.scalar(
+                    select(
+                        InventoryReservation
+                    ).where(
+                        InventoryReservation.order_id
+                        == order_id,
+                        InventoryReservation.variant_id
+                        == variant_id,
+                    )
+                )
+
+                if existing is not None:
+                    if (
+                        existing.status
+                        == ReservationStatus.RESERVED
+                    ):
+                        reserved_count += 1
+                        continue
+
+                    if (
+                        existing.status
+                        == ReservationStatus.COMMITTED
+                    ):
+                        reserved_count += 1
+                        continue
+
+                    raise ApplicationError(
+                        (
+                            "Inventory reservation was already "
+                            "released for variant "
+                            f"'{variant_id}'"
+                        ),
+                        type="ReservationAlreadyReleased",
+                        non_retryable=True,
+                    )
+
+                reserved = (
+                    inventory_service.try_reserve_stock(
+                        db,
+                        variant_id,
+                        qty,
+                        commit=False,
+                    )
+                )
+
+                if not reserved:
+                    raise ApplicationError(
+                        (
+                            "Insufficient stock for variant "
+                            f"'{variant_id}'"
+                        ),
+                        type="InsufficientStock",
+                        non_retryable=True,
+                    )
+
+                db.add(
+                    InventoryReservation(
+                        order_id=order_id,
+                        variant_id=variant_id,
+                        qty=qty,
+                        status=(
+                            ReservationStatus.RESERVED
+                        ),
+                    )
+                )
+
+                # Read the stock AFTER the successful atomic decrement.
+                remaining_stock = db.scalar(
+                    select(
+                        ProductVariant.stock
+                    ).where(
+                        ProductVariant.id == variant_id
+                    )
+                )
+
+                reserved_at = datetime.now(UTC)
+
+                # The event is inserted into the SAME transaction as
+                # the stock decrement and reservation row.
+                enqueue(
                     db,
-                    variant_id,
-                    qty,
-                    commit=False,
+                    event_type="inventory.reserved",
+                    data={
+                        "order_id": input.order_id,
+                        "variant_id": str(
+                            variant_id
+                        ),
+                        "qty": qty,
+                        "stockout": (
+                            remaining_stock == 0
+                        ),
+                        "reserved_at": (
+                            reserved_at.isoformat()
+                        ),
+                    },
+                    correlation_id=input.correlation_id,
                 )
-            )
 
-            if not reserved:
-                raise ApplicationError(
-                    (
-                        "Insufficient stock for variant "
-                        f"'{variant_id}'"
-                    ),
-                    type="InsufficientStock",
-                    non_retryable=True,
-                )
+                # These three things become durable together:
+                # 1. stock decrement
+                # 2. reservation row
+                # 3. inventory.reserved outbox event
+                db.commit()
 
-            db.add(
-                InventoryReservation(
-                    order_id=order_id,
-                    variant_id=variant_id,
-                    qty=qty,
-                    status=(
-                        ReservationStatus.RESERVED
-                    ),
-                )
-            )
+                reserved_count += 1
 
-            # Read the stock AFTER the successful atomic decrement.
-            remaining_stock = db.scalar(
-                select(
-                    ProductVariant.stock
-                ).where(
-                    ProductVariant.id == variant_id
-                )
-            )
-
-            reserved_at = datetime.now(UTC)
-
-            # The event is inserted into the SAME transaction as
-            # the stock decrement and reservation row.
-            enqueue(
+            _record_order_transition(
                 db,
-                event_type="inventory.reserved",
-                data={
-                    "order_id": input.order_id,
-                    "variant_id": str(
-                        variant_id
-                    ),
-                    "qty": qty,
-                    "stockout": (
-                        remaining_stock == 0
-                    ),
-                    "reserved_at": (
-                        reserved_at.isoformat()
-                    ),
-                },
-                correlation_id=(
-                    f"order-{input.order_id}"
-                ),
+                order,
+                OrderStatus.RESERVED,
             )
 
-            # These three things become durable together:
-            # 1. stock decrement
-            # 2. reservation row
-            # 3. inventory.reserved outbox event
             db.commit()
 
-            reserved_count += 1
+            bump_product_list_cache_version()
 
-        _record_order_transition(
-            db,
-            order,
-            OrderStatus.RESERVED,
-        )
-
-        db.commit()
-
-        bump_product_list_cache_version()
-
-        return {
-            "reserved_items": reserved_count
-        }
+            return {
+                "reserved_items": reserved_count
+            }
 
 @activity.defn
 def release_inventory_activity(
@@ -734,48 +775,54 @@ def release_inventory_activity(
     cannot add the same stock back twice.
     """
 
-    order_id = uuid.UUID(
-        input.order_id
-    )
-
-    released_count = 0
-
-    with SessionLocal() as db:
-        reservations = db.scalars(
-            select(
-                InventoryReservation
-            ).where(
-                InventoryReservation.order_id
-                == order_id,
-                InventoryReservation.status
-                == ReservationStatus.RESERVED,
-            )
-        ).all()
-
-        for reservation in reservations:
-
-            inventory_service.release_stock(
-                db,
-                reservation.variant_id,
-                reservation.qty,
-                commit=False,
-            )
-
-            reservation.status = (
-                ReservationStatus.RELEASED
-            )
-
-            # Stock restoration + RELEASED state commit together.
-            db.commit()
-
-            released_count += 1
+    with activity_correlation(
+        input.correlation_id
+    ):
+        logger.info("Releasing inventory for order %s", input.order_id)
 
 
-    if released_count > 0:
-        bump_product_list_cache_version()
-    return {
-        "released": released_count
-    }
+        order_id = uuid.UUID(
+            input.order_id
+        )
+
+        released_count = 0
+
+        with SessionLocal() as db:
+            reservations = db.scalars(
+                select(
+                    InventoryReservation
+                ).where(
+                    InventoryReservation.order_id
+                    == order_id,
+                    InventoryReservation.status
+                    == ReservationStatus.RESERVED,
+                )
+            ).all()
+
+            for reservation in reservations:
+
+                inventory_service.release_stock(
+                    db,
+                    reservation.variant_id,
+                    reservation.qty,
+                    commit=False,
+                )
+
+                reservation.status = (
+                    ReservationStatus.RELEASED
+                )
+
+                # Stock restoration + RELEASED state commit together.
+                db.commit()
+
+                released_count += 1
+
+
+        if released_count > 0:
+            bump_product_list_cache_version()
+        return {
+            "released": released_count
+        }
 
 @activity.defn
 def authorize_payment_activity(
@@ -788,52 +835,113 @@ def authorize_payment_activity(
     making Temporal retries safe.
     """
 
-    order_id = uuid.UUID(
-        input.order_id
-    )
+    with activity_correlation(
+        input.correlation_id
+    ):
+        logger.info("Authorizing payment for order %s", input.order_id)
 
-    with SessionLocal() as db:
-        order = db.get(
-            Order,
-            order_id,
+
+        order_id = uuid.UUID(
+            input.order_id
         )
 
-        if order is None:
-            raise ApplicationError(
-                f"Order '{order_id}' was not found",
-                type="OrderNotFound",
-                non_retryable=True,
+        with SessionLocal() as db:
+            order = db.get(
+                Order,
+                order_id,
             )
 
-        existing = db.scalar(
-            select(Payment).where(
-                Payment.order_id == order_id,
-                Payment.idempotency_key
-                == input.idempotency_key,
-            )
-        )
-
-        if existing is not None:
-
-            if (
-                existing.status
-                == PaymentStatus.FAILED
-            ):
+            if order is None:
                 raise ApplicationError(
-                    "Payment previously declined",
+                    f"Order '{order_id}' was not found",
+                    type="OrderNotFound",
+                    non_retryable=True,
+                )
+
+            existing = db.scalar(
+                select(Payment).where(
+                    Payment.order_id == order_id,
+                    Payment.idempotency_key
+                    == input.idempotency_key,
+                )
+            )
+
+            if existing is not None:
+
+                if (
+                    existing.status
+                    == PaymentStatus.FAILED
+                ):
+                    raise ApplicationError(
+                        "Payment previously declined",
+                        type="PaymentDeclined",
+                        non_retryable=True,
+                    )
+
+                if (
+                    existing.status
+                    == PaymentStatus.REFUNDED
+                ):
+                    raise ApplicationError(
+                        "Payment was already refunded",
+                        type="PaymentAlreadyRefunded",
+                        non_retryable=True,
+                    )
+
+                _record_order_transition(
+                    db,
+                    order,
+                    OrderStatus.PAID,
+                )
+
+                db.commit()
+
+                return {
+                    "payment_id": str(existing.id),
+                    "status": (
+                        PaymentStatus.AUTHORIZED.value
+                    ),
+                }
+
+            result = PaymentAuthorizer().authorize(
+                total=order.total,
+                idempotency_key=(
+                    input.idempotency_key
+                ),
+            )
+
+            payment = Payment(
+                order_id=order_id,
+                amount=order.total,
+                status=(
+                    PaymentStatus.AUTHORIZED
+                    if result.success
+                    else PaymentStatus.FAILED
+                ),
+                provider_ref=result.provider_ref,
+                idempotency_key=(
+                    input.idempotency_key
+                ),
+            )
+
+            db.add(payment)
+
+            if not result.success:
+                # Persist the failed payment attempt. No success event is emitted.
+                db.commit()
+                raise ApplicationError(
+                    (
+                        "Payment declined: "
+                        f"{result.reason}"
+                    ),
                     type="PaymentDeclined",
                     non_retryable=True,
                 )
 
-            if (
-                existing.status
-                == PaymentStatus.REFUNDED
-            ):
-                raise ApplicationError(
-                    "Payment was already refunded",
-                    type="PaymentAlreadyRefunded",
-                    non_retryable=True,
-                )
+            # Materialize payment.id without committing so the payment row,
+            # order transition, and payment.succeeded outbox event can all
+            # commit atomically.
+            db.flush()
 
             _record_order_transition(
                 db,
@@ -841,73 +949,26 @@ def authorize_payment_activity(
                 OrderStatus.PAID,
             )
 
+            enqueue(
+                db,
+                event_type="payment.succeeded",
+                data={
+                    "order_id": input.order_id,
+                    "payment_id": str(payment.id),
+                    "amount": str(payment.amount),
+                },
+                correlation_id=input.correlation_id,
+            )
+
             db.commit()
+            db.refresh(payment)
 
             return {
-                "payment_id": str(existing.id),
+                "payment_id": str(payment.id),
                 "status": (
                     PaymentStatus.AUTHORIZED.value
                 ),
             }
-
-        result = PaymentAuthorizer().authorize(
-            total=order.total,
-            idempotency_key=(
-                input.idempotency_key
-            ),
-        )
-
-        payment = Payment(
-            order_id=order_id,
-            amount=order.total,
-            status=(
-                PaymentStatus.AUTHORIZED
-                if result.success
-                else PaymentStatus.FAILED
-            ),
-            provider_ref=result.provider_ref,
-            idempotency_key=(
-                input.idempotency_key
-            ),
-        )
-
-        db.add(payment)
-        db.commit()
-        db.refresh(payment)
-
-        if not result.success:
-            raise ApplicationError(
-                (
-                    "Payment declined: "
-                    f"{result.reason}"
-                ),
-                type="PaymentDeclined",
-                non_retryable=True,
-            )
-
-        _record_order_transition(
-            db,
-            order,
-            OrderStatus.PAID,
-        )
-        enqueue(
-            db,
-            event_type="payment.succeeded",
-            data={
-                "order_id": input.order_id,
-                "payment_id": str(payment.id),
-                "amount": str(payment.amount),
-            },
-            correlation_id=f"order-{input.order_id}",
-        )
-        db.commit()
-
-        return {
-            "payment_id": str(payment.id),
-            "status": (
-                PaymentStatus.AUTHORIZED.value
-            ),
-        }
 
 @activity.defn
 def refund_payment_activity(
@@ -919,75 +980,92 @@ def refund_payment_activity(
     In Week 2 the refund is simulated by changing the Payment status.
     """
 
-    payment_id = uuid.UUID(
-        input.payment_id
-    )
+    with activity_correlation(
+        input.correlation_id
+    ):
+        logger.info("Refunding payment %s", input.payment_id)
 
-    with SessionLocal() as db:
-        payment = db.get(
-            Payment,
-            payment_id,
+
+        payment_id = uuid.UUID(
+            input.payment_id
         )
 
-        if payment is None:
-            raise ApplicationError(
-                f"Payment '{payment_id}' was not found",
-                type="PaymentNotFound",
-                non_retryable=True,
+        with SessionLocal() as db:
+            payment = db.get(
+                Payment,
+                payment_id,
             )
 
-        # Retry-safe: already refunded means the compensation
-        # has already happened.
-        if (
-            payment.status
-            == PaymentStatus.REFUNDED
-        ):
+            if payment is None:
+                raise ApplicationError(
+                    f"Payment '{payment_id}' was not found",
+                    type="PaymentNotFound",
+                    non_retryable=True,
+                )
+
+            # Retry-safe: already refunded means the compensation
+            # has already happened.
+            if (
+                payment.status
+                == PaymentStatus.REFUNDED
+            ):
+                return {
+                    "payment_id": str(payment.id),
+                    "status": (
+                        PaymentStatus.REFUNDED.value
+                    ),
+                }
+
+            if (
+                payment.status
+                != PaymentStatus.AUTHORIZED
+            ):
+                raise ApplicationError(
+                    (
+                        "Only an authorized payment "
+                        "can be refunded"
+                    ),
+                    type="InvalidPaymentState",
+                    non_retryable=True,
+                )
+
+            payment.status = PaymentStatus.REFUNDED
+
+            order = db.get(
+                Order,
+                payment.order_id,
+            )
+
+            if order is not None:
+                _record_order_transition(
+                    db,
+                    order,
+                    OrderStatus.REFUNDED,
+                    reason=(
+                        "Saga compensation refunded "
+                        "authorized payment"
+                    ),
+                )
+
+            enqueue(
+                db,
+                event_type="refund.processed",
+                data={
+                    "order_id": str(payment.order_id),
+                    "payment_id": str(payment.id),
+                    "amount": str(payment.amount),
+                },
+                correlation_id=input.correlation_id,
+            )
+
+            db.commit()
+
             return {
                 "payment_id": str(payment.id),
                 "status": (
                     PaymentStatus.REFUNDED.value
                 ),
             }
-
-        if (
-            payment.status
-            != PaymentStatus.AUTHORIZED
-        ):
-            raise ApplicationError(
-                (
-                    "Only an authorized payment "
-                    "can be refunded"
-                ),
-                type="InvalidPaymentState",
-                non_retryable=True,
-            )
-
-        payment.status = PaymentStatus.REFUNDED
-
-        order = db.get(
-            Order,
-            payment.order_id,
-        )
-
-        if order is not None:
-            _record_order_transition(
-                db,
-                order,
-                OrderStatus.REFUNDED,
-                reason=(
-                    "Saga compensation refunded "
-                    "authorized payment"
-                ),
-            )
-
-        db.commit()
-
-        return {
-            "payment_id": str(payment.id),
-            "status": (
-                PaymentStatus.REFUNDED.value
-            ),
-        }
 
 @activity.defn
 def create_shipment_activity(
@@ -996,84 +1074,106 @@ def create_shipment_activity(
     """
     Create one simulated shipment for the order.
 
-    If the Activity is retried, reuse the existing shipment.
+    If the Activity is retried, reuse the existing shipment. The
+    shipment.created event is emitted only when a new shipment row is
+    actually created.
     """
 
-    order_id = uuid.UUID(
-        input.order_id
-    )
+    with activity_correlation(
+        input.correlation_id
+    ):
+        logger.info("Creating shipment for order %s", input.order_id)
 
-    with SessionLocal() as db:
-        order = db.get(
-            Order,
-            order_id,
+
+        order_id = uuid.UUID(
+            input.order_id
         )
 
-        if order is None:
-            raise ApplicationError(
-                f"Order '{order_id}' was not found",
-                type="OrderNotFound",
-                non_retryable=True,
+        with SessionLocal() as db:
+            order = db.get(
+                Order,
+                order_id,
             )
 
-        shipment = db.scalar(
-            select(Shipment).where(
-                Shipment.order_id == order_id
-            )
-        )
+            if order is None:
+                raise ApplicationError(
+                    f"Order '{order_id}' was not found",
+                    type="OrderNotFound",
+                    non_retryable=True,
+                )
 
-        if shipment is None:
-            shipment = Shipment(
-                order_id=order_id,
-                status=ShipmentStatus.DISPATCHED,
-                address={},
-            )
-
-            db.add(shipment)
-            db.flush()
-
-        elif (
-            shipment.status
-            == ShipmentStatus.CREATED
-        ):
-            shipment.status = (
-                ShipmentStatus.DISPATCHED
+            shipment = db.scalar(
+                select(Shipment).where(
+                    Shipment.order_id == order_id
+                )
             )
 
-        _record_order_transition(
-            db,
-            order,
-            OrderStatus.SHIPPED,
-        )
-        enqueue(
-            db,
-            event_type="shipment.created",
-            data={
-                "order_id": input.order_id,
-                "shipment_id": str(shipment.id),
-            },
-            correlation_id=f"order-{input.order_id}",
-        )
-        db.commit()
-        db.refresh(shipment)
+            created_now = False
 
-        return {
-            "shipment_id": str(shipment.id)
-        }
+            if shipment is None:
+                shipment = Shipment(
+                    order_id=order_id,
+                    status=ShipmentStatus.DISPATCHED,
+                    address={},
+                )
+
+                db.add(shipment)
+                db.flush()
+                created_now = True
+
+            elif (
+                shipment.status
+                == ShipmentStatus.CREATED
+            ):
+                shipment.status = (
+                    ShipmentStatus.DISPATCHED
+                )
+
+            _record_order_transition(
+                db,
+                order,
+                OrderStatus.SHIPPED,
+            )
+
+            if created_now:
+                enqueue(
+                    db,
+                    event_type="shipment.created",
+                    data={
+                        "order_id": input.order_id,
+                        "shipment_id": str(shipment.id),
+                    },
+                    correlation_id=input.correlation_id,
+                )
+
+            db.commit()
+            db.refresh(shipment)
+
+            return {
+                "shipment_id": str(shipment.id)
+            }
+
 
 @activity.defn
 def notify_customer_activity(
     input: OrderIdInput,
 ) -> dict:
-    send_order_notification.delay(
-        input.order_id,
-        "completed",
-    )
 
-    return {
-        "queued": True,
-        "order_id": input.order_id,
-    }
+    with activity_correlation(
+        input.correlation_id
+    ):
+        logger.info("Queueing customer notification for order %s", input.order_id)
+
+        send_order_notification.delay(
+            input.order_id,
+            "completed",
+            input.correlation_id,
+        )
+
+        return {
+            "queued": True,
+            "order_id": input.order_id,
+        }
 
 
 @activity.defn
@@ -1090,93 +1190,99 @@ def confirm_order_activity(
     successfully consumed it.
     """
 
-    order_id = uuid.UUID(
-        input.order_id
-    )
+    with activity_correlation(
+        input.correlation_id
+    ):
+        logger.info("Confirming order %s", input.order_id)
 
-    with SessionLocal() as db:
-        order = db.get(
-            Order,
-            order_id,
+
+        order_id = uuid.UUID(
+            input.order_id
         )
 
-        if order is None:
-            raise ApplicationError(
-                f"Order '{order_id}' was not found",
-                type="OrderNotFound",
-                non_retryable=True,
+        with SessionLocal() as db:
+            order = db.get(
+                Order,
+                order_id,
             )
 
-        if (
-            order.status
-            == OrderStatus.COMPLETED
-        ):
+            if order is None:
+                raise ApplicationError(
+                    f"Order '{order_id}' was not found",
+                    type="OrderNotFound",
+                    non_retryable=True,
+                )
+
+            if (
+                order.status
+                == OrderStatus.COMPLETED
+            ):
+                return {
+                    "status": (
+                        OrderStatus.COMPLETED.value
+                    )
+                }
+
+            shipment = db.scalar(
+                select(Shipment).where(
+                    Shipment.order_id == order_id
+                )
+            )
+
+            if shipment is not None:
+                shipment.status = (
+                    ShipmentStatus.DELIVERED
+                )
+
+            if (
+                order.status
+                != OrderStatus.DELIVERED
+            ):
+                _record_order_transition(
+                    db,
+                    order,
+                    OrderStatus.DELIVERED,
+                )
+
+            _record_order_transition(
+                db,
+                order,
+                OrderStatus.COMPLETED,
+            )
+            enqueue(
+                db,
+                event_type="order.confirmed",
+                data={
+                    "order_id": input.order_id,
+                    "customer_id": str(order.customer_id),
+                    "total": str(order.total),
+                },
+                correlation_id=input.correlation_id,
+            )
+
+            reservations = db.scalars(
+                select(
+                    InventoryReservation
+                ).where(
+                    InventoryReservation.order_id
+                    == order_id,
+                    InventoryReservation.status
+                    == ReservationStatus.RESERVED,
+                )
+            ).all()
+
+            for reservation in reservations:
+                reservation.status = (
+                    ReservationStatus.COMMITTED
+                )
+
+            db.commit()
+
             return {
                 "status": (
                     OrderStatus.COMPLETED.value
                 )
             }
-
-        shipment = db.scalar(
-            select(Shipment).where(
-                Shipment.order_id == order_id
-            )
-        )
-
-        if shipment is not None:
-            shipment.status = (
-                ShipmentStatus.DELIVERED
-            )
-
-        if (
-            order.status
-            != OrderStatus.DELIVERED
-        ):
-            _record_order_transition(
-                db,
-                order,
-                OrderStatus.DELIVERED,
-            )
-
-        _record_order_transition(
-            db,
-            order,
-            OrderStatus.COMPLETED,
-        )
-        enqueue(
-            db,
-            event_type="order.confirmed",
-            data={
-                "order_id": input.order_id,
-                "customer_id": str(order.customer_id),
-                "total": str(order.total),
-            },
-            correlation_id=f"order-{input.order_id}",
-        )
-
-        reservations = db.scalars(
-            select(
-                InventoryReservation
-            ).where(
-                InventoryReservation.order_id
-                == order_id,
-                InventoryReservation.status
-                == ReservationStatus.RESERVED,
-            )
-        ).all()
-
-        for reservation in reservations:
-            reservation.status = (
-                ReservationStatus.COMMITTED
-            )
-
-        db.commit()
-
-        return {
-            "status": (
-                OrderStatus.COMPLETED.value
-            )
-        }
 
 #-----Add rejection and cancellation Activities
 @activity.defn
@@ -1188,38 +1294,44 @@ def reject_order_activity(
     could not be reserved.
     """
 
-    order_id = uuid.UUID(
-        input.order_id
-    )
+    with activity_correlation(
+        input.correlation_id
+    ):
+        logger.info("Rejecting order %s", input.order_id)
 
-    with SessionLocal() as db:
-        order = db.get(
-            Order,
-            order_id,
+
+        order_id = uuid.UUID(
+            input.order_id
         )
 
-        if order is None:
-            raise ApplicationError(
-                f"Order '{order_id}' was not found",
-                type="OrderNotFound",
-                non_retryable=True,
+        with SessionLocal() as db:
+            order = db.get(
+                Order,
+                order_id,
             )
 
-        _record_order_transition(
-            db,
-            order,
-            OrderStatus.REJECTED,
-            reason=input.reason,
-        )
+            if order is None:
+                raise ApplicationError(
+                    f"Order '{order_id}' was not found",
+                    type="OrderNotFound",
+                    non_retryable=True,
+                )
 
-        db.commit()
+            _record_order_transition(
+                db,
+                order,
+                OrderStatus.REJECTED,
+                reason=input.reason,
+            )
 
-        return {
-            "status": (
-                OrderStatus.REJECTED.value
-            ),
-            "reason": input.reason,
-        }
+            db.commit()
+
+            return {
+                "status": (
+                    OrderStatus.REJECTED.value
+                ),
+                "reason": input.reason,
+            }
 
 @activity.defn
 def cancel_order_activity(
@@ -1229,35 +1341,41 @@ def cancel_order_activity(
     Mark an order CANCELLED after required compensation has completed.
     """
 
-    order_id = uuid.UUID(
-        input.order_id
-    )
+    with activity_correlation(
+        input.correlation_id
+    ):
+        logger.info("Cancelling order %s", input.order_id)
 
-    with SessionLocal() as db:
-        order = db.get(
-            Order,
-            order_id,
+
+        order_id = uuid.UUID(
+            input.order_id
         )
 
-        if order is None:
-            raise ApplicationError(
-                f"Order '{order_id}' was not found",
-                type="OrderNotFound",
-                non_retryable=True,
+        with SessionLocal() as db:
+            order = db.get(
+                Order,
+                order_id,
             )
 
-        _record_order_transition(
-            db,
-            order,
-            OrderStatus.CANCELLED,
-            reason=input.reason,
-        )
+            if order is None:
+                raise ApplicationError(
+                    f"Order '{order_id}' was not found",
+                    type="OrderNotFound",
+                    non_retryable=True,
+                )
 
-        db.commit()
+            _record_order_transition(
+                db,
+                order,
+                OrderStatus.CANCELLED,
+                reason=input.reason,
+            )
 
-        return {
-            "status": (
-                OrderStatus.CANCELLED.value
-            ),
-            "reason": input.reason,
-        }
+            db.commit()
+
+            return {
+                "status": (
+                    OrderStatus.CANCELLED.value
+                ),
+                "reason": input.reason,
+            }

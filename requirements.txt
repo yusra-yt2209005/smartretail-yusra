@@ -19,3 +19,4 @@ temporalio==1.31.0
 redis==5.0.8
 celery[redis]==5.4.0
 confluent-kafka==2.6.1
+prometheus-client==0.21.1

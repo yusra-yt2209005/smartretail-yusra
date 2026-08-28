@@ -3,7 +3,16 @@ from celery.schedules import crontab
 
 from app.core.config import settings
 
+from celery.signals import setup_logging
 
+from app.core.logging import configure_logging
+
+@setup_logging.connect
+def setup_celery_logging(
+    **kwargs,
+):
+    configure_logging()
+    
 celery_app = Celery(
     "smartretail",
     broker=settings.celery_broker_url,

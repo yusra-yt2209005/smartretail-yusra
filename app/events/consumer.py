@@ -5,16 +5,24 @@ import signal
 from confluent_kafka import Consumer
 
 from app.core.config import settings
+from app.core.correlation import (
+    reset_correlation_id,
+    set_correlation_id,
+)
+from app.core.logging import configure_logging
+from app.core.metrics import (
+    EVENTS_CONSUMED_TOTAL,
+    EVENTS_FAILED_TOTAL,
+)
 from app.db.session import SessionLocal
 from app.events.handlers import process_event
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+configure_logging()
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(
+    "smartretail.kafka.consumer"
+)
 
 
 def build_consumer() -> Consumer:
@@ -87,11 +95,35 @@ def run() -> None:
                 )
                 continue
 
+            # Defaults let us record a useful failure metric even if
+            # decoding/parsing fails before we can read event_type.
+            envelope = None
+            event_type = "unknown"
+            token = None
+
             try:
                 envelope = json.loads(
-                    message.value().decode(
-                        "utf-8"
-                    )
+                    message.value().decode("utf-8")
+                )
+
+                event_type = envelope.get(
+                    "event_type",
+                    "unknown",
+                )
+
+                correlation_id = envelope.get(
+                    "correlation_id",
+                    "-",
+                )
+
+                token = set_correlation_id(
+                    correlation_id
+                )
+
+                logger.info(
+                    "Received Kafka event %s (%s)",
+                    envelope.get("event_id"),
+                    event_type,
                 )
 
                 with SessionLocal() as db:
@@ -100,17 +132,19 @@ def run() -> None:
                         envelope,
                     )
 
-                # A duplicate is still considered successfully handled.
-                #
-                # process_event() returns:
-                # True  -> event was newly applied
-                # False -> event was already processed
-                #
-                # In both cases it is safe to advance the Kafka offset.
+                # Commit the Kafka offset ONLY after database
+                # processing succeeds or the event is safely
+                # identified as a duplicate.
                 consumer.commit(
                     message=message,
                     asynchronous=False,
                 )
+
+                # Count every Kafka message that was handled
+                # successfully, including safe duplicate deliveries.
+                EVENTS_CONSUMED_TOTAL.labels(
+                    event_type=event_type,
+                ).inc()
 
                 logger.info(
                     "%s Kafka event %s (%s)",
@@ -119,24 +153,32 @@ def run() -> None:
                         if applied
                         else "Skipped duplicate"
                     ),
-                    envelope.get(
-                        "event_id"
-                    ),
-                    envelope.get(
-                        "event_type"
-                    ),
+                    envelope.get("event_id"),
+                    event_type,
                 )
 
             except Exception:
+                # A duplicate is not a failure because process_event()
+                # handles it normally and returns False. This counter
+                # therefore represents actual processing failures.
+                EVENTS_FAILED_TOTAL.labels(
+                    event_type=event_type,
+                ).inc()
+
                 logger.exception(
-                    "Failed to process Kafka event"
+                    "Failed to process Kafka message"
                 )
 
                 # IMPORTANT:
                 # Do not commit the Kafka offset here.
-                #
-                # If processing failed, Kafka can redeliver
-                # this message later.
+                # Kafka may redeliver the message, and processed_events
+                # keeps that retry safe.
+
+            finally:
+                if token is not None:
+                    reset_correlation_id(
+                        token
+                    )
 
     finally:
         consumer.close()

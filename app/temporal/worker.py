@@ -12,9 +12,9 @@ from app.temporal.workflows import (
     OrderSagaWorkflow,
     ProductPublishingWorkflow,
 )
+from app.core.logging import configure_logging
 
 
-logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,7 @@ async def connect_to_temporal() -> Client:
 
 
 async def main() -> None:
+    configure_logging()
     """
     Connect to Temporal and start a worker listening on the
     SmartRetail task queue.

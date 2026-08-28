@@ -6,6 +6,10 @@ from app.services import (
 )
 from app.workers.celery_app import celery_app
 
+from app.core.correlation import (
+    reset_correlation_id,
+    set_correlation_id,
+)
 
 MAX_RETRIES = 3
 
@@ -34,25 +38,17 @@ def _backoff_seconds(
 @celery_app.task(
     bind=True,
     max_retries=MAX_RETRIES,
-    name=(
-        "app.workers.tasks.notifications."
-        "send_order_notification"
-    ),
+    name="app.workers.tasks.notifications.send_order_notification",
 )
 def send_order_notification(
     self,
     order_id: str,
     event_type: str,
+    correlation_id: str,
 ) -> dict:
-    """
-    Thin Celery wrapper around notification_service.
-
-    On failure:
-        retry with exponential backoff
-
-    After the final allowed retry:
-        write the failed task to failed_jobs
-    """
+    token = set_correlation_id(
+        correlation_id
+    )
 
     try:
         notification = (
@@ -61,6 +57,12 @@ def send_order_notification(
                 order_id,
                 event_type,
             )
+        )
+
+        logger.info(
+            "Notification created for order %s (%s)",
+            order_id,
+            event_type,
         )
 
         return {
@@ -72,9 +74,16 @@ def send_order_notification(
         }
 
     except Exception as exc:
-
         attempt_number = (
             self.request.retries + 1
+        )
+
+        logger.warning(
+            "Notification task failed for order %s "
+            "on attempt %s: %s",
+            order_id,
+            attempt_number,
+            exc,
         )
 
         if (
@@ -82,13 +91,12 @@ def send_order_notification(
             >= self.max_retries
         ):
             failed_job_service.record_failure(
-                task_name=(
-                    "send_order_notification"
-                ),
+                task_name="send_order_notification",
                 task_id=self.request.id,
                 payload={
                     "order_id": order_id,
                     "event_type": event_type,
+                    "correlation_id": correlation_id,
                 },
                 error=str(exc),
                 attempts=attempt_number,
@@ -105,4 +113,9 @@ def send_order_notification(
             countdown=_backoff_seconds(
                 self.request.retries
             ),
+        )
+
+    finally:
+        reset_correlation_id(
+            token
         )

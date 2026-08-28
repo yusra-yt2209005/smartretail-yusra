@@ -1,9 +1,8 @@
+from dataclasses import dataclass
 from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from dataclasses import dataclass
-from datetime import timedelta
 
 with workflow.unsafe.imports_passed_through():
     from app.temporal.activities import (
@@ -39,10 +38,12 @@ DEFAULT_RETRY = RetryPolicy(
     maximum_interval=timedelta(seconds=10),
     maximum_attempts=3,
 )
+
 @dataclass
 class OrderSagaInput:
     order_id: str
     idempotency_key: str
+    correlation_id: str
 
 @workflow.defn
 class HelloWorkflow:
@@ -244,6 +245,7 @@ class OrderSagaWorkflow:
                 reserve_inventory_activity,
                 OrderIdInput(
                     order_id=order_id,
+                    correlation_id=input.correlation_id,
                 ),
                 start_to_close_timeout=DEFAULT_TIMEOUT,
                 retry_policy=DEFAULT_RETRY,
@@ -260,6 +262,7 @@ class OrderSagaWorkflow:
                 release_inventory_activity,
                 OrderIdInput(
                     order_id=order_id,
+                    correlation_id=input.correlation_id,
                 ),
                 start_to_close_timeout=DEFAULT_TIMEOUT,
                 retry_policy=DEFAULT_RETRY,
@@ -275,6 +278,7 @@ class OrderSagaWorkflow:
                         "Inventory reservation failed: "
                         f"{exc}"
                     ),
+                    correlation_id=input.correlation_id,
                 ),
                 start_to_close_timeout=DEFAULT_TIMEOUT,
                 retry_policy=DEFAULT_RETRY,
@@ -300,6 +304,7 @@ class OrderSagaWorkflow:
                 AuthorizePaymentInput(
                     order_id=order_id,
                     idempotency_key=input.idempotency_key,
+                    correlation_id=input.correlation_id,
                 ),
                 start_to_close_timeout=DEFAULT_TIMEOUT,
                 retry_policy=DEFAULT_RETRY,
@@ -316,6 +321,7 @@ class OrderSagaWorkflow:
                 release_inventory_activity,
                 OrderIdInput(
                     order_id=order_id,
+                    correlation_id=input.correlation_id,
                 ),
                 start_to_close_timeout=DEFAULT_TIMEOUT,
                 retry_policy=DEFAULT_RETRY,
@@ -331,6 +337,7 @@ class OrderSagaWorkflow:
                         "Payment authorization failed: "
                         f"{exc}"
                     ),
+                    correlation_id=input.correlation_id,
                 ),
                 start_to_close_timeout=DEFAULT_TIMEOUT,
                 retry_policy=DEFAULT_RETRY,
@@ -359,6 +366,7 @@ class OrderSagaWorkflow:
                 create_shipment_activity,
                 OrderIdInput(
                     order_id=order_id,
+                    correlation_id=input.correlation_id,
                 ),
                 start_to_close_timeout=DEFAULT_TIMEOUT,
                 retry_policy=DEFAULT_RETRY,
@@ -370,6 +378,7 @@ class OrderSagaWorkflow:
                 notify_customer_activity,
                 OrderIdInput(
                     order_id=order_id,
+                    correlation_id=input.correlation_id,
                 ),
                 start_to_close_timeout=DEFAULT_TIMEOUT,
                 retry_policy=DEFAULT_RETRY,
@@ -381,6 +390,7 @@ class OrderSagaWorkflow:
                 confirm_order_activity,
                 OrderIdInput(
                     order_id=order_id,
+                    correlation_id=input.correlation_id,
                 ),
                 start_to_close_timeout=DEFAULT_TIMEOUT,
                 retry_policy=DEFAULT_RETRY,
@@ -407,6 +417,7 @@ class OrderSagaWorkflow:
                         "Post-payment saga step failed: "
                         f"{exc}"
                     ),
+                    correlation_id=input.correlation_id,
                 ),
                 start_to_close_timeout=DEFAULT_TIMEOUT,
                 retry_policy=DEFAULT_RETRY,
@@ -418,6 +429,7 @@ class OrderSagaWorkflow:
                 refund_payment_activity,
                 PaymentIdInput(
                     payment_id=payment_id,
+                    correlation_id=input.correlation_id,
                 ),
                 start_to_close_timeout=DEFAULT_TIMEOUT,
                 retry_policy=DEFAULT_RETRY,
@@ -429,6 +441,7 @@ class OrderSagaWorkflow:
                 release_inventory_activity,
                 OrderIdInput(
                     order_id=order_id,
+                    correlation_id=input.correlation_id,
                 ),
                 start_to_close_timeout=DEFAULT_TIMEOUT,
                 retry_policy=DEFAULT_RETRY,
