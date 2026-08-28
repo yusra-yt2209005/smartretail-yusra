@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     celery_broker_url: str = "redis://redis:6379/0"
     celery_result_backend: str = "redis://redis:6379/1"
 
+    kafka_bootstrap_servers: str = "kafka:9092"
+    kafka_events_topic: str = "smartretail.events" 
+
+    kafka_consumer_group: str = "smartretail-analytics"
+
 
 # Instantiated once at import time and reused everywhere (a singleton).
 # Creating Settings() is cheap but re-parsing env vars on every request

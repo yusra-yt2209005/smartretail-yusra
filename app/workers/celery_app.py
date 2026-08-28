@@ -11,7 +11,8 @@ celery_app = Celery(
     include=[
         "app.workers.tasks.notifications",
         "app.workers.tasks.analytics",
-    ],
+        "app.workers.tasks.outbox_publisher",
+    ]
 )
 
 
@@ -32,6 +33,14 @@ celery_app.conf.update(
             "schedule": crontab(
                 minute="*/5"
             ),
+        },
+
+        "publish-outbox-every-5-seconds": {
+            "task": (
+                "app.workers.tasks.outbox_publisher."
+                "run_outbox_publish"
+            ),
+            "schedule": 5.0,
         },
     },
 )

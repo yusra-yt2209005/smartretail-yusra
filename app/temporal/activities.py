@@ -45,6 +45,10 @@ from app.core.cache import (
 
 from app.workers.tasks.notifications import send_order_notification
 
+
+from app.events.outbox import enqueue
+from app.models.product_variant import ProductVariant
+
 #ORDER ACTIVTY
 # reserve_inventory_activity
 # release_inventory_activity
@@ -437,10 +441,21 @@ def mark_product_published_activity(
                 type="InvalidProductState",
                 non_retryable=True,
             )
+
+
+        product.status = ProductStatus.PUBLISHED
         if product.published_at is None:
             product.published_at = datetime.now(UTC)
 
-        product.status = ProductStatus.PUBLISHED
+        enqueue(
+            db,
+            event_type="product.published",
+            data={
+                "product_id": str(product.id),
+                "published_at": product.published_at.isoformat(),
+            },
+            correlation_id=f"product-{product.id}",
+        )
 
         db.commit()
         bump_product_list_cache_version()
@@ -539,9 +554,11 @@ def reserve_inventory_activity(
     """
     Reserve every variant requested by an order.
 
-    Each stock decrement is paired with its InventoryReservation row
-    in the same database transaction so a Temporal retry cannot
-    decrement the same order/variant twice.
+    Each stock decrement, InventoryReservation row, and
+    inventory.reserved outbox event are committed together.
+
+    This keeps the reservation retry-safe and guarantees that
+    an event is recorded only when the reservation succeeds.
     """
 
     order_id = uuid.UUID(
@@ -567,8 +584,8 @@ def reserve_inventory_activity(
             )
         ).all()
 
-        # Combine duplicate variants if the same variant somehow
-        # appears more than once in an order.
+        # Combine duplicate variants if the same variant
+        # somehow appears more than once in an order.
         quantities: dict[uuid.UUID, int] = {}
 
         for item in items:
@@ -650,9 +667,46 @@ def reserve_inventory_activity(
                 )
             )
 
-            # Stock decrement + reservation row become durable together.
+            # Read the stock AFTER the successful atomic decrement.
+            remaining_stock = db.scalar(
+                select(
+                    ProductVariant.stock
+                ).where(
+                    ProductVariant.id == variant_id
+                )
+            )
+
+            reserved_at = datetime.now(UTC)
+
+            # The event is inserted into the SAME transaction as
+            # the stock decrement and reservation row.
+            enqueue(
+                db,
+                event_type="inventory.reserved",
+                data={
+                    "order_id": input.order_id,
+                    "variant_id": str(
+                        variant_id
+                    ),
+                    "qty": qty,
+                    "stockout": (
+                        remaining_stock == 0
+                    ),
+                    "reserved_at": (
+                        reserved_at.isoformat()
+                    ),
+                },
+                correlation_id=(
+                    f"order-{input.order_id}"
+                ),
+            )
+
+            # These three things become durable together:
+            # 1. stock decrement
+            # 2. reservation row
+            # 3. inventory.reserved outbox event
             db.commit()
-            
+
             reserved_count += 1
 
         _record_order_transition(
@@ -662,7 +716,9 @@ def reserve_inventory_activity(
         )
 
         db.commit()
+
         bump_product_list_cache_version()
+
         return {
             "reserved_items": reserved_count
         }
@@ -834,7 +890,16 @@ def authorize_payment_activity(
             order,
             OrderStatus.PAID,
         )
-
+        enqueue(
+            db,
+            event_type="payment.succeeded",
+            data={
+                "order_id": input.order_id,
+                "payment_id": str(payment.id),
+                "amount": str(payment.amount),
+            },
+            correlation_id=f"order-{input.order_id}",
+        )
         db.commit()
 
         return {
@@ -965,6 +1030,7 @@ def create_shipment_activity(
             )
 
             db.add(shipment)
+            qdb.flush()
 
         elif (
             shipment.status
@@ -979,7 +1045,15 @@ def create_shipment_activity(
             order,
             OrderStatus.SHIPPED,
         )
-
+        enqueue(
+            db,
+            event_type="shipment.created",
+            data={
+                "order_id": input.order_id,
+                "shipment_id": str(shipment.id),
+            },
+            correlation_id=f"order-{input.order_id}",
+        )
         db.commit()
         db.refresh(shipment)
 
@@ -1068,6 +1142,16 @@ def confirm_order_activity(
             db,
             order,
             OrderStatus.COMPLETED,
+        )
+        enqueue(
+            db,
+            event_type="order.confirmed",
+            data={
+                "order_id": input.order_id,
+                "customer_id": str(order.customer_id),
+                "total": str(order.total),
+            },
+            correlation_id=f"order-{input.order_id}",
         )
 
         reservations = db.scalars(

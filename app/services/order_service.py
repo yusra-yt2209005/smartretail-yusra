@@ -16,6 +16,7 @@ from app.models.product import Product, ProductStatus
 from app.models.product_variant import ProductVariant
 from app.models.user import User
 from app.schemas.order import OrderCreate
+from app.events.outbox import enqueue
 
 
 def get_order(
@@ -211,7 +212,16 @@ def build_order(
             reason=None,
         )
     )
-
+    enqueue(
+        db,
+        event_type="order.placed",
+        data={
+            "order_id": str(order.id),
+            "customer_id": str(order.customer_id),
+            "total": str(order.total),
+        },
+        correlation_id=f"order-{order.id}",
+    )
     db.commit()
 
     # Reload items so OrderOut can serialize them.

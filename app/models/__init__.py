@@ -36,3 +36,5 @@ from app.models.analytics import (
     AnalyticsProduct,
 )  # noqa: F401
 
+from app.models.outbox_event import OutboxEvent  # noqa: F401
+
