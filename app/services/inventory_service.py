@@ -3,14 +3,10 @@ import uuid
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
-from app.models.product_variant import ProductVariant
 from app.core.metrics import (
     INVENTORY_OVERSELL_PREVENTED_TOTAL,
 )
-
-if reserved_variant_id is None:
-    INVENTORY_OVERSELL_PREVENTED_TOTAL.inc()
-    return False
+from app.models.product_variant import ProductVariant
 
 
 def try_reserve_stock(
@@ -45,10 +41,21 @@ def try_reserve_stock(
 
     row = db.execute(stmt).first()
 
+    # No row means the UPDATE condition failed, usually because
+    # there was not enough stock. The atomic database check has
+    # therefore prevented an oversell.
+    if row is None:
+        INVENTORY_OVERSELL_PREVENTED_TOTAL.inc()
+
+        if commit:
+            db.commit()
+
+        return False
+
     if commit:
         db.commit()
 
-    return row is not None
+    return True
 
 
 def release_stock(

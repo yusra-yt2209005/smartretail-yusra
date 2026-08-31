@@ -1,5 +1,5 @@
 import random
-
+import logging
 from app.services import (
     failed_job_service,
     notification_service,
@@ -10,6 +10,9 @@ from app.core.correlation import (
     reset_correlation_id,
     set_correlation_id,
 )
+
+logger = logging.getLogger(__name__)
+
 
 MAX_RETRIES = 3
 

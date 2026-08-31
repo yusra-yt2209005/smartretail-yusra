@@ -123,7 +123,7 @@ async def correlation_id_middleware(
 
 @app.get(
     "/metrics",
-    include_in_schema=False,
+    include_in_schema=True,
 )
 def metrics():
     return Response(

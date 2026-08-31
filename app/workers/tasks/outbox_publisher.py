@@ -1,9 +1,7 @@
 import logging
 
 from app.db.session import SessionLocal
-from app.events.producer import (
-    publish_pending_outbox,
-)
+from app.events.producer import publish_pending_outbox
 from app.workers.celery_app import celery_app
 
 
@@ -22,9 +20,7 @@ def run_outbox_publish() -> int:
     """
 
     with SessionLocal() as db:
-        count = publish_pending_outbox(
-            db
-        )
+        count = publish_pending_outbox(db)
 
     if count:
         logger.info(
