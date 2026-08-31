@@ -79,12 +79,35 @@ services:
       retries: 10
     restart: unless-stopped
 
+  api:
+    build: .
+    container_name: app-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/code
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+
+
   # Temporal (Week 2+): durable workflow engine for the publishing / processing
   # workflow. `auto-setup` starts the server and creates its schema inside the
   # Postgres above (in its own `temporal` / `temporal_visibility` databases).
   # Your app runs a Temporal *worker* (a separate process, like the Celery
   # worker) that hosts your Workflow and Activity code and connects to
   # temporal:7233.
+
   temporal:
     image: temporalio/auto-setup:1.24.2
     container_name: app-temporal
@@ -104,6 +127,7 @@ services:
   # Temporal Web UI: browse workflows, inspect histories, see where a workflow
   # is running, retried or stuck. http://localhost:8233  Your best Temporal
   # debugger — open it before you start guessing.
+
   temporal-ui:
     image: temporalio/ui:2.26.2
     container_name: app-temporal-ui
@@ -114,6 +138,25 @@ services:
     ports:
       - "8233:8080"
     restart: unless-stopped
+
+  temporal-worker:
+    build: .
+    container_name: app-temporal-worker
+    command: python -m app.temporal.worker
+    env_file:
+      - .env
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    volumes:
+      - .:/code
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+
+
 
   # ---------------------------------------------------------------------------
   # Week 3+ services. Started only with:  --profile week3
@@ -127,39 +170,159 @@ services:
   #   PLAINTEXT_HOST (localhost:29092) for your laptop / a local script
   # A broker advertises the address clients should use to reach it, which is
   # why one physical broker needs two advertised addresses here.
-  kafka:
-    image: apache/kafka:3.7.0
-    container_name: app-kafka
-    profiles: ["week3"]
-    ports:
-      - "29092:29092"
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      CLUSTER_ID: app-local-cluster
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_NUM_PARTITIONS: 1
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+  celery-worker:
+    build: .
+    container_name: app-celery-worker
+    #command: celery -A app.workers.celery_app.celery_app worker --loglevel=info
+    command: celery -A app.workers.celery_app worker --loglevel=info
+    env_file:
+      - .env
     volumes:
-      - kafka_data:/var/lib/kafka/data
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
-      interval: 10s
-      timeout: 10s
-      retries: 15
-      start_period: 30s
+      - .:/code
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
     restart: unless-stopped
 
+  # --- Week 3: Celery Beat ---
+  # Schedules the periodic analytics rollup.
+  celery-beat:
+    build: .
+    container_name: app-celery-beat
+
+    command: celery -A app.workers.celery_app beat --loglevel=info
+
+    env_file:
+      - .env
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
+      postgres:
+        condition: service_healthy
+
+    volumes:
+      - .:/code
+
+    restart: unless-stopped
+
+  # --- Week 3: Kafka ---
+  kafka:
+    image: confluentinc/cp-kafka:7.9.0
+    container_name: app-kafka
+    hostname: kafka
+
+    ports:
+      - "29092:29092"
+
+    environment:
+      KAFKA_NODE_ID: 1
+
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      KAFKA_LISTENERS: >
+        PLAINTEXT://kafka:9092,
+        CONTROLLER://kafka:9093,
+        PLAINTEXT_HOST://0.0.0.0:29092
+
+      KAFKA_ADVERTISED_LISTENERS: >
+        PLAINTEXT://kafka:9092,
+        PLAINTEXT_HOST://localhost:29092
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: >
+        CONTROLLER:PLAINTEXT,
+        PLAINTEXT:PLAINTEXT,
+        PLAINTEXT_HOST:PLAINTEXT
+
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-topics --bootstrap-server kafka:9092 --list >/dev/null 2>&1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+    restart: unless-stopped
+
+
+
+  # kafka:
+  #   image: apache/kafka:3.7.0
+  #   container_name: app-kafka
+  #   profiles: ["week3"]
+  #   ports:
+  #     - "29092:29092"
+  #   environment:
+  #     KAFKA_NODE_ID: 1
+  #     KAFKA_PROCESS_ROLES: broker,controller
+  #     CLUSTER_ID: app-local-cluster
+  #     KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+  #     KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+  #     KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+  #     KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+  #     KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  #     KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  #     KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+  #     KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+  #     KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+  #     KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  #     KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+  #     KAFKA_NUM_PARTITIONS: 1
+  #     KAFKA_LOG_DIRS: /var/lib/kafka/data
+  #   volumes:
+  #     - kafka_data:/var/lib/kafka/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+  #     interval: 10s
+  #     timeout: 10s
+  #     retries: 15
+  #     start_period: 30s
+  #   restart: unless-stopped
+  # --- Week 3: Kafka analytics consumer ---
+  consumer:
+    build: .
+    container_name: app-kafka-consumer
+
+    command: python -m app.events.consumer
+
+    env_file:
+      - .env
+
+    volumes:
+      - .:/code
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+      kafka:
+        condition: service_healthy
+
+    restart: unless-stopped
   # Browse topics, inspect messages, watch consumer lag: http://localhost:8080
   # Your best debugging tool in Week 3. Use it before you start guessing.
   kafka-ui:
@@ -183,20 +346,29 @@ services:
   #
   # Requires ./prometheus/prometheus.yml in your repo (see the example
   # alongside this file).
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   container_name: app-prometheus
+  #   profiles: ["week3"]
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - prometheus_data:/prometheus
+  #   command:
+  #     - "--config.file=/etc/prometheus/prometheus.yml"
+  #     - "--storage.tsdb.retention.time=7d"
+  #   restart: unless-stopped
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.55.1
     container_name: app-prometheus
-    profiles: ["week3"]
-    ports:
-      - "9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.retention.time=7d"
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
     restart: unless-stopped
-
 # ---------------------------------------------------------------------------
 # YOUR services go here. Sketch for reference — you write the real ones,
 # along with the Dockerfile they use.
