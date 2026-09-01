@@ -281,38 +281,47 @@ def process_media_activity(
             "media_processed": len(product.media),
         }
 
-
 @activity.defn
 def build_catalog_activity(
     input: ProductIdInput,
 ) -> str:
     """
-    Build an enriched catalog representation of the product.
+    Build semantic search text for a product.
 
-    The result combines:
-    - product title
+    The chunk contains information useful for meaning-based retrieval:
+    - title
     - category
+    - variant attributes/specifications
     - description
-    - variant SKUs
-    - prices
-    - variant attributes
 
-    The returned text is passed to chunk_product_activity.
+    Price, stock and status are deliberately excluded because those
+    values are retrieval metadata rather than semantic content.
+    This also allows a price-only or stock-only change to update
+    metadata later without requiring a new embedding.
 
     Idempotency:
-    This Activity only reads database state and returns derived text.
+    This Activity is read-only and creates deterministic text from the
+    current product data.
     """
 
-    product_id = uuid.UUID(input.product_id)
+    product_id = uuid.UUID(
+        input.product_id
+    )
 
     with SessionLocal() as db:
         product = db.scalar(
             select(Product)
             .options(
-                selectinload(Product.variants),
-                selectinload(Product.category),
+                selectinload(
+                    Product.variants
+                ),
+                selectinload(
+                    Product.category
+                ),
             )
-            .where(Product.id == product_id)
+            .where(
+                Product.id == product_id
+            )
         )
 
         if product is None:
@@ -328,38 +337,51 @@ def build_catalog_activity(
             else "Uncategorized"
         )
 
-        variant_parts: list[str] = []
+        # Collect unique searchable specifications from all variants.
+        # A set avoids repeating shared attributes such as brand.
+        attribute_bits: set[str] = set()
 
-        # Sort by SKU so the generated text is stable.
-        for variant in sorted(
-            product.variants,
-            key=lambda item: item.sku,
-        ):
-            attributes = json.dumps(
-                variant.attributes or {},
-                sort_keys=True,
-            )
+        for variant in product.variants:
+            for key, value in (
+                variant.attributes or {}
+            ).items():
 
-            variant_parts.append(
-                (
-                    f"SKU: {variant.sku}; "
-                    f"Price: {variant.price}; "
-                    f"Attributes: {attributes}"
+                if value is None:
+                    continue
+
+                if isinstance(
+                    value,
+                    (dict, list),
+                ):
+                    value_text = json.dumps(
+                        value,
+                        sort_keys=True,
+                    )
+                else:
+                    value_text = str(value)
+
+                attribute_bits.add(
+                    f"{key}: {value_text}"
                 )
-            )
 
-        variants_text = " | ".join(
-            variant_parts
+        specifications = (
+            ", ".join(
+                sorted(attribute_bits)
+            )
+            if attribute_bits
+            else "No additional specifications"
         )
 
         catalog_text = (
             f"Title: {product.title.strip()}\n"
             f"Category: {category_name}\n"
-            f"Description: {product.description.strip()}\n"
-            f"Variants: {variants_text}"
+            f"Specifications: {specifications}\n"
+            f"Description: "
+            f"{product.description.strip()}"
         )
 
         return catalog_text
+
 
 
 @activity.defn
