@@ -1,0 +1,52 @@
+[
+    {
+        "query": "Apple iPhone 16 phone",
+        "expected_product_id": "576e5eeb-11ba-4ccf-9e85-ebcaa430010f",
+        "expected_title": "M2 Apple iPhone 16"
+    },
+    {
+        "query": "Apple USB-C charger",
+        "expected_product_id": "4cabb8e9-c274-4fb7-925c-7235ed1a1c6f",
+        "expected_title": "M2 Apple USB-C Charger"
+    },
+    {
+        "query": "Dell Inspiron 14 laptop",
+        "expected_product_id": "a65eb709-bdc4-4e5a-b6c4-08cfeee52216",
+        "expected_title": "M2 Dell Inspiron 14 Laptop"
+    },
+    {
+        "query": "Google Pixel 9 phone",
+        "expected_product_id": "d222b611-bcb7-43a6-9bcc-eabe35d49a1b",
+        "expected_title": "M2 Google Pixel 9"
+    },
+    {
+        "query": "Lenovo ThinkPad laptop",
+        "expected_product_id": "9b8ace30-087d-422c-8cb9-843bb279e84f",
+        "expected_title": "M2 Lenovo ThinkPad Laptop"
+    },
+    {
+        "query": "Samsung fast charger",
+        "expected_product_id": "85609085-6063-49b4-8c0c-0b96b3d1ac46",
+        "expected_title": "M2 Samsung Charger"
+    },
+    {
+        "query": "Samsung Galaxy A56 phone",
+        "expected_product_id": "77c97ecb-b5b9-479a-bf86-6302efc45134",
+        "expected_title": "M2 Samsung Galaxy A56"
+    },
+    {
+        "query": "Samsung Galaxy S25 phone",
+        "expected_product_id": "4a55dc3c-ff1a-4da5-ac7f-31ae9262f299",
+        "expected_title": "M2 Samsung Galaxy S25"
+    },
+    {
+        "query": "USB-C fast charging cable",
+        "expected_product_id": "f00f08d7-81ce-437d-b1ad-60982d88f52d",
+        "expected_title": "M2 USB-C Fast Charging Cable"
+    },
+    {
+        "query": "Apple OLED 5G iPhone",
+        "expected_product_id": "576e5eeb-11ba-4ccf-9e85-ebcaa430010f",
+        "expected_title": "M2 Apple iPhone 16"
+    }
+]

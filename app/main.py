@@ -9,6 +9,7 @@ from app.api.v1 import (
     health,
     orders,
     products,
+    search
 )
 from app.core.exceptions import AppError
 import uuid
@@ -49,6 +50,7 @@ app.include_router(categories.router)
 app.include_router(products.router)
 app.include_router(orders.router)
 app.include_router(analytics.router)
+app.include_router(search.router)
 @app.middleware("http")
 
 async def correlation_id_middleware(

@@ -38,6 +38,17 @@ class Settings(BaseSettings):
 
     openai_api_key: str = ""
 
+    embedding_batch_size: int = 32
+
+
+        # --- Week 4: semantic search ---
+
+    search_default_top_k: int = 5
+
+    # Initial threshold for FakeEmbeddings.
+    # Tune this later using the retrieval evaluation set.
+    search_similarity_threshold: float = 0.10
+
 
 # Instantiated once at import time and reused everywhere (a singleton).
 # Creating Settings() is cheap but re-parsing env vars on every request

@@ -20,6 +20,23 @@ if TYPE_CHECKING:
     from app.models.product import Product
 
 
+from pgvector.sqlalchemy import Vector
+
+from decimal import Decimal
+
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
+
+from app.core.config import settings
+
 class ContentChunk(TimestampMixin, Base):
     """
     Searchable text generated from a product during publishing.
@@ -54,6 +71,26 @@ class ContentChunk(TimestampMixin, Base):
         index=True,
     )
 
+    variant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "product_variants.id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        index=True,
+    )
+
+    category_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "categories.id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        index=True,
+    )
+
     chunk_index: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -71,6 +108,34 @@ class ContentChunk(TimestampMixin, Base):
         index=True,
     )
 
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(settings.vector_dimensions),
+        nullable=True,
+    )
+
+
+    price: Mapped[Decimal | None] = mapped_column(
+        Numeric(10, 2),
+        nullable=True,
+    )
+
+    status: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        index=True,
+    )
+
+    available: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        index=True,
+    )
+
+    in_stock: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        index=True,
+    )
     embedded_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,

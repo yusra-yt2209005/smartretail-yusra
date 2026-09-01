@@ -4,7 +4,7 @@ import uuid
 from datetime import UTC, datetime
 from dataclasses import dataclass
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import selectinload
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -56,6 +56,11 @@ from app.core.correlation import (
     reset_correlation_id,
     set_correlation_id,
 )
+
+from app.ai.embeddings import (
+    get_embedding_provider,
+)
+from app.core.config import settings
 
 logger = logging.getLogger(
     "smartretail.temporal.activities"
@@ -389,18 +394,25 @@ def chunk_product_activity(
     input: ChunkProductInput,
 ) -> dict:
     """
-    Store the current searchable product text as a ContentChunk.
+    Create or update the searchable chunk for a product.
 
-    Week 2 creates one enriched chunk per product.
+    If the semantic text hash is unchanged, preserve the existing
+    embedding and only refresh metadata such as price, stock and status.
 
-    Idempotency:
-    Existing chunks for this product are deleted before the new chunk
-    is inserted. Therefore retries or future re-publishing replace the
-    old data instead of creating duplicate/stale chunks.
+    If the semantic text changed, clear the old embedding so the next
+    embedding Activity regenerates it.
+
+    This keeps re-publishing idempotent and avoids unnecessary provider
+    calls for price-only or stock-only changes.
     """
 
-    product_id = uuid.UUID(input.product_id)
-    catalog_text = input.catalog_text.strip()
+    product_id = uuid.UUID(
+        input.product_id
+    )
+
+    catalog_text = (
+        input.catalog_text.strip()
+    )
 
     if not catalog_text:
         raise ApplicationError(
@@ -414,9 +426,16 @@ def chunk_product_activity(
     ).hexdigest()
 
     with SessionLocal() as db:
-        product = db.get(
-            Product,
-            product_id,
+        product = db.scalar(
+            select(Product)
+            .options(
+                selectinload(
+                    Product.variants
+                ),
+            )
+            .where(
+                Product.id == product_id
+            )
         )
 
         if product is None:
@@ -426,30 +445,336 @@ def chunk_product_activity(
                 non_retryable=True,
             )
 
-        # Remove any previous chunks for this product.
-        #
-        # Delete + insert happens in the same transaction because commit()
-        # happens only after the new chunk has been added.
-        db.execute(
-            delete(ContentChunk).where(
-                ContentChunk.product_id == product_id
+        if not product.variants:
+            raise ApplicationError(
+                "Product has no variants to index",
+                type="NoProductVariants",
+                non_retryable=True,
+            )
+
+        # -----------------------------------------------------
+        # Refresh searchable metadata
+        # -----------------------------------------------------
+
+        active_variants = [
+            variant
+            for variant in product.variants
+            if variant.is_active
+        ]
+
+        buyable_variants = [
+            variant
+            for variant in active_variants
+            if variant.stock > 0
+        ]
+
+        available = bool(
+            active_variants
+        )
+
+        in_stock = bool(
+            buyable_variants
+        )
+
+        if buyable_variants:
+            price_candidates = (
+                buyable_variants
+            )
+
+        elif active_variants:
+            price_candidates = (
+                active_variants
+            )
+
+        else:
+            price_candidates = list(
+                product.variants
+            )
+
+        indexed_price = min(
+            variant.price
+            for variant
+            in price_candidates
+        )
+
+        # -----------------------------------------------------
+        # Find current chunk
+        # -----------------------------------------------------
+
+        existing_chunk = db.scalar(
+            select(ContentChunk)
+            .where(
+                ContentChunk.product_id
+                == product_id,
+                ContentChunk.chunk_index
+                == 0,
             )
         )
 
-        chunk = ContentChunk(
-            product_id=product_id,
-            chunk_index=0,
-            text=catalog_text,
-            text_hash=text_hash,
-            embedded_at=None,
+        # Our current strategy is one semantic chunk per product.
+        # Remove stale extra chunks if an older implementation
+        # produced more than one.
+        db.execute(
+            delete(ContentChunk)
+            .where(
+                ContentChunk.product_id
+                == product_id,
+                ContentChunk.chunk_index
+                != 0,
+            )
         )
 
-        db.add(chunk)
+        # -----------------------------------------------------
+        # First publish
+        # -----------------------------------------------------
+
+        if existing_chunk is None:
+            chunk = ContentChunk(
+                product_id=product_id,
+                variant_id=None,
+                category_id=(
+                    product.category_id
+                ),
+                chunk_index=0,
+                text=catalog_text,
+                text_hash=text_hash,
+                embedding=None,
+                price=indexed_price,
+                status=product.status.value,
+                available=available,
+                in_stock=in_stock,
+                embedded_at=None,
+            )
+
+            db.add(chunk)
+
+            text_changed = True
+            reused_embedding = False
+
+        # -----------------------------------------------------
+        # Re-publish
+        # -----------------------------------------------------
+
+        else:
+            text_changed = (
+                existing_chunk.text_hash
+                != text_hash
+            )
+
+            existing_chunk.text = (
+                catalog_text
+            )
+
+            existing_chunk.text_hash = (
+                text_hash
+            )
+
+            existing_chunk.category_id = (
+                product.category_id
+            )
+
+            existing_chunk.variant_id = None
+
+            existing_chunk.price = (
+                indexed_price
+            )
+
+            existing_chunk.status = (
+                product.status.value
+            )
+
+            existing_chunk.available = (
+                available
+            )
+
+            existing_chunk.in_stock = (
+                in_stock
+            )
+
+            if text_changed:
+                # Semantic content changed.
+                # Existing vector no longer represents the text.
+                existing_chunk.embedding = None
+                existing_chunk.embedded_at = None
+
+                reused_embedding = False
+
+            else:
+                # Only metadata changed.
+                # Existing vector remains valid.
+                reused_embedding = (
+                    existing_chunk.embedding
+                    is not None
+                )
+
         db.commit()
 
         return {
             "chunks_written": 1,
             "text_hash": text_hash,
+            "text_changed": text_changed,
+            "reused_embedding": (
+                reused_embedding
+            ),
+        }
+
+
+@activity.defn
+def embed_product_chunks_activity(
+    input: ProductIdInput,
+) -> dict:
+    """
+    Generate and store embeddings for all chunks belonging to a product.
+
+    Chunks are embedded in batches instead of making one provider call
+    per chunk. Provider failures are allowed to propagate so Temporal
+    can retry this Activity according to the workflow retry policy.
+
+    Week 4 currently creates one chunk per product, but this Activity is
+    written for multiple chunks so the indexing pipeline scales without
+    changing its design later.
+    """
+
+    product_id = uuid.UUID(
+        input.product_id
+    )
+
+    provider = (
+        get_embedding_provider()
+    )
+
+    with SessionLocal() as db:
+        all_chunks = list(
+            db.scalars(
+                select(ContentChunk)
+                .where(
+                    ContentChunk.product_id
+                    == product_id
+                )
+                .order_by(
+                    ContentChunk.chunk_index
+                )
+            ).all()
+        )
+
+        if not all_chunks:
+            raise ApplicationError(
+                (
+                    "No content chunks found for "
+                    f"product '{product_id}'"
+                ),
+                type="NoContentChunks",
+                non_retryable=True,
+            )
+
+        chunks = [
+            chunk
+            for chunk in all_chunks
+            if chunk.embedding is None
+        ]
+
+        if not chunks:
+            return {
+                "chunks_embedded": 0,
+                "chunks_skipped": len(
+                    all_chunks
+                ),
+                "embedding_model": (
+                    "unchanged"
+                ),
+                "dimensions": (
+                    settings.vector_dimensions
+                ),
+            }
+        if not chunks:
+            raise ApplicationError(
+                (
+                    "No content chunks found for "
+                    f"product '{product_id}'"
+                ),
+                type="NoContentChunks",
+                non_retryable=True,
+            )
+
+        embedded_count = 0
+
+        batch_size = (
+            settings.embedding_batch_size
+        )
+
+        for start in range(
+            0,
+            len(chunks),
+            batch_size,
+        ):
+            batch = chunks[
+                start : start + batch_size
+            ]
+
+            texts = [
+                chunk.text
+                for chunk in batch
+            ]
+
+            # If the real provider fails here, do NOT turn it into a
+            # non-retryable ApplicationError. Let the exception escape
+            # so Temporal can retry the Activity.
+            vectors = provider.embed_batch(
+                texts
+            )
+
+            if len(vectors) != len(batch):
+                raise ApplicationError(
+                    (
+                        "Embedding provider returned "
+                        "an unexpected number of vectors"
+                    ),
+                    type="InvalidEmbeddingResponse",
+                    non_retryable=True,
+                )
+
+            for chunk, vector in zip(
+                batch,
+                vectors,
+            ):
+                if (
+                    len(vector)
+                    != settings.vector_dimensions
+                ):
+                    raise ApplicationError(
+                        (
+                            "Embedding dimension mismatch: "
+                            f"expected "
+                            f"{settings.vector_dimensions}, "
+                            f"got {len(vector)}"
+                        ),
+                        type="EmbeddingDimensionMismatch",
+                        non_retryable=True,
+                    )
+
+                chunk.embedding = vector
+                chunk.embedded_at = (
+                    datetime.now(UTC)
+                )
+
+                embedded_count += 1
+
+        db.commit()
+
+        return {
+            "chunks_embedded": (
+                embedded_count
+            ),
+            "chunks_skipped": (
+                len(all_chunks)
+                - embedded_count
+            ),
+            "embedding_model": (
+                provider.model_name
+            ),
+            "dimensions": (
+                provider.dimensions
+            ),
         }
 
 
@@ -503,6 +828,18 @@ def mark_product_published_activity(
 
 
         product.status = ProductStatus.PUBLISHED
+        # Keep the search-index metadata consistent with the product's final
+        # lifecycle state. This update commits atomically with publication.
+        db.execute(
+            update(ContentChunk)
+            .where(
+                ContentChunk.product_id
+                == product_id
+            )
+            .values(
+                status=ProductStatus.PUBLISHED.value
+            )
+        )
         if product.published_at is None:
             product.published_at = datetime.now(UTC)
 
