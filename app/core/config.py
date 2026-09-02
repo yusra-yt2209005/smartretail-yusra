@@ -50,6 +50,19 @@ class Settings(BaseSettings):
     search_similarity_threshold: float = 0.20
 
 
+        # --- Week 5: LLM ---
+
+    # Which text-generation implementation to use.
+    # "fake" is the safe default for local development/tests.
+    llm_provider: str = "fake"
+
+    # Used only when the real OpenAI provider is selected.
+    llm_model: str = "gpt-5.6-luna"
+
+    # Maximum time allowed for one provider request.
+    llm_timeout_seconds: float = 30.0
+
+
 # Instantiated once at import time and reused everywhere (a singleton).
 # Creating Settings() is cheap but re-parsing env vars on every request
 # would be wasteful and could theoretically see a value change mid-request.
