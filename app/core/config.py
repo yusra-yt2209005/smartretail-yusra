@@ -47,7 +47,7 @@ class Settings(BaseSettings):
 
     # Initial threshold for FakeEmbeddings.
     # Tune this later using the retrieval evaluation set.
-    search_similarity_threshold: float = 0.10
+    search_similarity_threshold: float = 0.20
 
 
 # Instantiated once at import time and reused everywhere (a singleton).
