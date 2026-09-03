@@ -1,8 +1,11 @@
 import uuid
 from decimal import Decimal
 from enum import Enum
-
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    Field,
+    field_validator,
+)
 
 class AssistantIntent(str, Enum):
     DISCOVERY = "discovery"
@@ -24,6 +27,30 @@ class AssistantRequest(BaseModel):
         ge=1,
         le=20,
     )
+
+    @field_validator("question")
+    @classmethod
+    def validate_question(
+        cls,
+        value: str,
+    ) -> str:
+        """
+        Normalize and reject empty or invalid questions.
+        """
+
+        value = value.strip()
+
+        if not value:
+            raise ValueError(
+                "Question must not be empty."
+            )
+
+        if "\x00" in value:
+            raise ValueError(
+                "Question contains invalid characters."
+            )
+
+        return value
 
 
 class AssistantCitation(BaseModel):

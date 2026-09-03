@@ -33,6 +33,12 @@ NO_RESULTS_MESSAGE = (
     "that match your request."
 )
 
+UNSAFE_INPUT_MESSAGE = (
+    "I can help with product discovery, comparisons, "
+    "and buying guidance, but I can't follow requests "
+    "to override or reveal my instructions."
+)
+
 COMPARISON_KEYWORDS = (
     "compare",
     "comparison",
@@ -52,6 +58,22 @@ GUIDANCE_KEYWORDS = (
     "help me choose",
     "best for me",
     "recommend for me",
+)
+
+PROMPT_INJECTION_PATTERNS = (
+    "ignore previous instructions",
+    "ignore all previous instructions",
+    "ignore your instructions",
+    "ignore the system prompt",
+    "reveal your system prompt",
+    "show me your system prompt",
+    "print your system prompt",
+    "reveal hidden instructions",
+    "show hidden instructions",
+    "act as a different assistant",
+    "change your role",
+    "bypass your rules",
+    "jailbreak",
 )
 
 
@@ -130,6 +152,8 @@ def _build_citations(
         )
         for product in products
     ]
+
+
 
 def detect_intent(
     question: str,
@@ -397,8 +421,24 @@ async def ask_assistant(
     llm: LLMProvider | None = None,
 ) -> AssistantResponse:
     """
-    Route a customer question to the correct assistant behavior.
+    Validate and route a customer question to the correct
+    assistant behavior.
     """
+
+    question = question.strip()
+
+    if contains_prompt_injection(
+        question
+    ):
+        return AssistantResponse(
+            question=question,
+            answer=UNSAFE_INPUT_MESSAGE,
+            intent=AssistantIntent.DISCOVERY,
+            citations=[],
+            refused=True,
+            prompt_version=None,
+            model=None,
+        )
 
     intent = detect_intent(
         question
@@ -515,4 +555,25 @@ async def ask_guidance(
             GUIDANCE_PROMPT_VERSION
         ),
         model=result.model,
+    )
+
+def contains_prompt_injection(
+    question: str,
+) -> bool:
+    """
+    Detect common direct attempts to override assistant instructions.
+
+    This is an additional application-level guard. Prompt grounding
+    rules still remain in prompts.py.
+    """
+
+    normalized = (
+        " ".join(
+            question.lower().split()
+        )
+    )
+
+    return any(
+        pattern in normalized
+        for pattern in PROMPT_INJECTION_PATTERNS
     )
