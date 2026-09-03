@@ -391,3 +391,177 @@ def test_comparison_uses_top_two_results(
         response.citations[1].title
         == "Phone 2"
     )
+
+def test_detects_guidance_intent():
+    assert (
+        assistant_service.detect_intent(
+            "Which phone should I buy?"
+        )
+        == AssistantIntent.GUIDANCE
+    )
+
+    assert (
+        assistant_service.detect_intent(
+            "Help me choose a Samsung phone"
+        )
+        == AssistantIntent.GUIDANCE
+    )
+
+def test_guidance_calls_llm_when_products_found(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        lambda *args, **kwargs: (
+            _fake_products()
+        ),
+    )
+
+    llm = FakeLLM(
+        response_text=(
+            "The Demo Phone may suit your needs."
+        )
+    )
+
+    response = asyncio.run(
+        assistant_service.ask_guidance(
+            db=None,
+            question=(
+                "Which phone should I buy?"
+            ),
+            llm=llm,
+        )
+    )
+
+    assert response.refused is False
+
+    assert (
+        response.intent
+        == AssistantIntent.GUIDANCE
+    )
+
+    assert len(response.citations) == 1
+    assert len(llm.calls) == 1
+
+    assert (
+        response.prompt_version
+        == "guidance-v1"
+    )
+
+def test_guidance_does_not_call_llm_when_no_products(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        lambda *args, **kwargs: [],
+    )
+
+    llm = FakeLLM(
+        response_text=(
+            "This must not be used."
+        )
+    )
+
+    response = asyncio.run(
+        assistant_service.ask_guidance(
+            db=None,
+            question=(
+                "Which product should I buy?"
+            ),
+            llm=llm,
+        )
+    )
+
+    assert response.refused is True
+
+    assert (
+        response.intent
+        == AssistantIntent.GUIDANCE
+    )
+
+    assert response.citations == []
+
+    assert len(llm.calls) == 0
+
+
+def test_assistant_routes_guidance_request(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        lambda *args, **kwargs: (
+            _fake_products()
+        ),
+    )
+
+    llm = FakeLLM(
+        response_text="Buying guidance."
+    )
+
+    response = asyncio.run(
+        assistant_service.ask_assistant(
+            db=None,
+            question=(
+                "Which phone should I buy?"
+            ),
+            llm=llm,
+        )
+    )
+
+    assert (
+        response.intent
+        == AssistantIntent.GUIDANCE
+    )
+
+def test_guidance_cleans_retrieval_query():
+    query = (
+        assistant_service
+        .build_retrieval_query(
+            "Which Samsung phone should I buy?",
+            AssistantIntent.GUIDANCE,
+        )
+    )
+
+    assert query == "samsung phone"
+
+def test_guidance_uses_clean_retrieval_query(
+    monkeypatch,
+):
+    captured = {}
+
+    def fake_search(
+        db,
+        *,
+        query,
+        top_k,
+        include_context,
+    ):
+        captured["query"] = query
+
+        return _fake_products()
+
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        fake_search,
+    )
+
+    llm = FakeLLM()
+
+    asyncio.run(
+        assistant_service.ask_guidance(
+            db=None,
+            question=(
+                "Which Samsung phone should I buy?"
+            ),
+            llm=llm,
+        )
+    )
+
+    assert (
+        captured["query"]
+        == "samsung phone"
+    )

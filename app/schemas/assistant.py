@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 class AssistantIntent(str, Enum):
     DISCOVERY = "discovery"
     COMPARISON = "comparison"
-
+    GUIDANCE = "guidance"
 
 class AssistantRequest(BaseModel):
     """

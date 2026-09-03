@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import re 
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -21,8 +21,10 @@ from app.services.search_service import (
 from app.ai.prompts import (
     COMPARISON_PROMPT_VERSION,
     DISCOVERY_PROMPT_VERSION,
+    GUIDANCE_PROMPT_VERSION,
     build_comparison_prompt,
     build_discovery_prompt,
+    build_guidance_prompt,
 )
 
 
@@ -38,6 +40,18 @@ COMPARISON_KEYWORDS = (
     " versus ",
     "difference between",
     "differences between",
+)
+
+GUIDANCE_KEYWORDS = (
+    "should i buy",
+    "should i choose",
+    "what should i buy",
+    "which should i buy",
+    "which one should i buy",
+    "which one should i choose",
+    "help me choose",
+    "best for me",
+    "recommend for me",
 )
 
 
@@ -123,8 +137,8 @@ def detect_intent(
     """
     Determine the assistant intent from the customer's question.
 
-    Comparison detection is deterministic and does not require
-    another LLM call.
+    Intent routing is deterministic and does not require
+    an additional LLM call.
     """
 
     normalized = (
@@ -137,7 +151,72 @@ def detect_intent(
     ):
         return AssistantIntent.COMPARISON
 
+    if any(
+        keyword in normalized
+        for keyword in GUIDANCE_KEYWORDS
+    ):
+        return AssistantIntent.GUIDANCE
+
     return AssistantIntent.DISCOVERY
+
+
+def build_retrieval_query(
+    question: str,
+    intent: AssistantIntent,
+) -> str:
+    """
+    Remove intent-related wording that does not help catalog retrieval.
+
+    The original customer question is still preserved for the LLM prompt.
+    """
+
+    query = question.strip()
+
+    if intent == AssistantIntent.GUIDANCE:
+        removable_phrases = (
+            "which one should i buy",
+            "which should i buy",
+            "what should i buy",
+            "should i buy",
+            "which one should i choose",
+            "should i choose",
+            "help me choose",
+        )
+
+        lowered = query.lower()
+
+        for phrase in removable_phrases:
+            lowered = lowered.replace(
+                phrase,
+                " ",
+            )
+
+        # Remove punctuation left behind by the original question.
+        lowered = re.sub(
+            r"[^\w\s-]",
+            " ",
+            lowered,
+        )
+
+        query = " ".join(
+            lowered.split()
+        )
+
+        words = query.split()
+
+        while (
+            words
+            and words[0]
+            in {
+                "which",
+                "what",
+            }
+        ):
+            words.pop(0)
+
+        query = " ".join(words)
+
+    return query or question.strip()
 
 async def ask_discovery(
     db: Session,
@@ -336,9 +415,104 @@ async def ask_assistant(
             llm=llm,
         )
 
+    if (
+        intent
+        == AssistantIntent.GUIDANCE
+    ):
+        return await ask_guidance(
+            db,
+            question=question,
+            top_k=top_k,
+            llm=llm,
+        )
+
     return await ask_discovery(
         db,
         question=question,
         top_k=top_k,
         llm=llm,
+    )
+
+async def ask_guidance(
+    db: Session,
+    *,
+    question: str,
+    top_k: int = 5,
+    llm: LLMProvider | None = None,
+) -> AssistantResponse:
+    """
+    Give grounded buying guidance using currently buyable
+    products retrieved from the catalog.
+    """
+
+    question = question.strip()
+
+    retrieval_query = build_retrieval_query(
+        question,
+        AssistantIntent.GUIDANCE,
+    )
+
+    products = search_products(
+        db,
+        query=retrieval_query,
+        top_k=top_k,
+        include_context=True,
+    )
+
+    # Buying advice must never be invented when retrieval
+    # returns no valid products.
+    if not products:
+        return AssistantResponse(
+            question=question,
+            answer=(
+                "I couldn't find any currently available "
+                "products that match your needs."
+            ),
+            intent=AssistantIntent.GUIDANCE,
+            citations=[],
+            refused=True,
+            prompt_version=(
+                GUIDANCE_PROMPT_VERSION
+            ),
+            model=None,
+        )
+
+    prompt_products = (
+        _build_prompt_products(
+            products
+        )
+    )
+
+    system_prompt, user_prompt = (
+        build_guidance_prompt(
+            question,
+            prompt_products,
+        )
+    )
+
+    provider = (
+        llm
+        if llm is not None
+        else get_llm_provider()
+    )
+
+    result = await provider.generate(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
+
+    citations = _build_citations(
+        products
+    )
+
+    return AssistantResponse(
+        question=question,
+        answer=result.text,
+        intent=AssistantIntent.GUIDANCE,
+        citations=citations,
+        refused=False,
+        prompt_version=(
+            GUIDANCE_PROMPT_VERSION
+        ),
+        model=result.model,
     )
