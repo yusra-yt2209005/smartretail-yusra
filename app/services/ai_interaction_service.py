@@ -25,15 +25,24 @@ def record_ai_interaction(
     input_tokens: int = 0,
     output_tokens: int = 0,
     latency_ms: float = 0.0,
+    correlation_id: str | None = None,
 ) -> AIInteraction:
     """
-    Persist one completed/refused AI assistant interaction.
+    Persist one AI assistant interaction.
+
+    Streaming callers may supply the correlation ID captured before
+    the response stream begins. Non-streaming callers continue using
+    the current request correlation ID automatically.
     """
 
+    resolved_correlation_id = (
+        correlation_id
+        if correlation_id is not None
+        else get_correlation_id()
+    )
+
     interaction = AIInteraction(
-        correlation_id=(
-            get_correlation_id()
-        ),
+        correlation_id=resolved_correlation_id,
         question=question,
         intent=intent,
         answer=answer,

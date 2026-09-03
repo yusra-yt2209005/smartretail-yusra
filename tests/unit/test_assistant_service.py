@@ -251,121 +251,67 @@ def test_defaults_to_discovery_intent():
         == AssistantIntent.DISCOVERY
     )
 
-def test_comparison_calls_llm_with_two_products(
+
+def test_extracts_comparison_targets():
+    targets = (
+        assistant_service
+        .extract_comparison_targets(
+            "Compare Samsung Galaxy A56 "
+            "and Samsung Galaxy S25"
+        )
+    )
+
+    assert targets == (
+        "Samsung Galaxy A56",
+        "Samsung Galaxy S25",
+    )
+
+def test_extracts_comparison_targets_with_vs():
+    targets = (
+        assistant_service
+        .extract_comparison_targets(
+            "Galaxy A56 vs Galaxy S25"
+        )
+    )
+
+    assert targets == (
+        "Galaxy A56",
+        "Galaxy S25",
+    )
+
+def test_comparison_resolves_named_products(
     monkeypatch,
 ):
-    second_product = {
+    first = {
+        **_fake_products()[0],
+        "title": "M2 Samsung Galaxy A56",
+    }
+
+    second = {
         **_fake_products()[0],
         "product_id": uuid.uuid4(),
         "variant_id": uuid.uuid4(),
-        "title": "Second Phone",
-        "price": Decimal("1299.99"),
+        "title": "M2 Samsung Galaxy S25",
+        "price": Decimal("3299.99"),
     }
 
-    products = [
-        _fake_products()[0],
-        second_product,
-    ]
+    def fake_find(
+        db,
+        *,
+        name,
+    ):
+        if name == "Samsung Galaxy A56":
+            return first
+
+        if name == "Samsung Galaxy S25":
+            return second
+
+        return None
 
     monkeypatch.setattr(
         assistant_service,
-        "search_products",
-        lambda *args, **kwargs: products,
-    )
-
-    llm = FakeLLM(
-        response_text=(
-            "Comparison response."
-        )
-    )
-
-    response = asyncio.run(
-        assistant_service.ask_comparison(
-            db=None,
-            question=(
-                "Compare Demo Phone "
-                "and Second Phone"
-            ),
-            llm=llm,
-        )
-    )
-
-    assert response.refused is False
-
-    assert (
-        response.intent
-        == AssistantIntent.COMPARISON
-    )
-
-    assert len(response.citations) == 2
-    assert len(llm.calls) == 1
-
-    user_prompt = (
-        llm.calls[0]["user_prompt"]
-    )
-
-    assert "Demo Phone" in user_prompt
-    assert "Second Phone" in user_prompt
-
-
-def test_comparison_refuses_when_fewer_than_two_products(
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        assistant_service,
-        "search_products",
-        lambda *args, **kwargs: (
-            _fake_products()
-        ),
-    )
-
-    llm = FakeLLM(
-        response_text=(
-            "This should not be used."
-        )
-    )
-
-    response = asyncio.run(
-        assistant_service.ask_comparison(
-            db=None,
-            question=(
-                "Compare Demo Phone "
-                "with another phone"
-            ),
-            llm=llm,
-        )
-    )
-
-    assert response.refused is True
-
-    assert (
-        response.intent
-        == AssistantIntent.COMPARISON
-    )
-
-    assert response.citations == []
-
-    assert len(llm.calls) == 0
-
-def test_comparison_uses_top_two_results(
-    monkeypatch,
-):
-    products = []
-
-    for index in range(3):
-        product = {
-            **_fake_products()[0],
-            "product_id": uuid.uuid4(),
-            "variant_id": uuid.uuid4(),
-            "title": f"Phone {index + 1}",
-        }
-
-        products.append(product)
-
-    monkeypatch.setattr(
-        assistant_service,
-        "search_products",
-        lambda *args, **kwargs: products,
+        "find_buyable_product_by_name",
+        fake_find,
     )
 
     llm = FakeLLM(
@@ -375,22 +321,86 @@ def test_comparison_uses_top_two_results(
     response = asyncio.run(
         assistant_service.ask_comparison(
             db=None,
-            question="Compare phones",
+            question=(
+                "Compare Samsung Galaxy A56 "
+                "and Samsung Galaxy S25"
+            ),
             llm=llm,
         )
     )
 
-    assert len(response.citations) == 2
+    assert response.refused is False
+
+    assert len(
+        response.citations
+    ) == 2
 
     assert (
         response.citations[0].title
-        == "Phone 1"
+        == "M2 Samsung Galaxy A56"
     )
 
     assert (
         response.citations[1].title
-        == "Phone 2"
+        == "M2 Samsung Galaxy S25"
     )
+
+    assert len(llm.calls) == 1
+
+def test_comparison_does_not_substitute_missing_product(
+    monkeypatch,
+):
+    real_product = {
+        **_fake_products()[0],
+        "title": "M2 Samsung Galaxy S25",
+    }
+
+    def fake_find(
+        db,
+        *,
+        name,
+    ):
+        if name == "Samsung Galaxy S25":
+            return real_product
+
+        # FakePhone is not in the catalog.
+        return None
+
+    monkeypatch.setattr(
+        assistant_service,
+        "find_buyable_product_by_name",
+        fake_find,
+    )
+
+    llm = FakeLLM(
+        response_text=(
+            "This must not be used."
+        )
+    )
+
+    response = asyncio.run(
+        assistant_service.ask_comparison(
+            db=None,
+            question=(
+                "Compare Samsung Galaxy S25 "
+                "and FakePhone Ultra 9000"
+            ),
+            llm=llm,
+        )
+    )
+
+    assert response.refused is True
+
+    assert (
+        "FakePhone Ultra 9000"
+        in response.answer
+    )
+
+    # Critical grounding requirement:
+    # do not call the LLM and do not substitute another product.
+    assert len(llm.calls) == 0
+
+
 
 def test_detects_guidance_intent():
     assert (
@@ -644,3 +654,51 @@ def disable_ai_interaction_persistence(
         "_persist_interaction",
         lambda *args, **kwargs: None,
     )
+
+def test_one_word_question_is_handled_gracefully(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        lambda *args, **kwargs: [],
+    )
+
+    llm = FakeLLM(
+        response_text="Must not be used."
+    )
+
+    response = asyncio.run(
+        assistant_service.ask_assistant(
+            db=None,
+            question="phone",
+            llm=llm,
+        )
+    )
+
+    assert response.refused is True
+    assert len(llm.calls) == 0
+
+def test_gibberish_question_is_handled_gracefully(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        lambda *args, **kwargs: [],
+    )
+
+    llm = FakeLLM(
+        response_text="Must not be used."
+    )
+
+    response = asyncio.run(
+        assistant_service.ask_assistant(
+            db=None,
+            question="zxqplmwoeiruty",
+            llm=llm,
+        )
+    )
+
+    assert response.refused is True
+    assert len(llm.calls) == 0

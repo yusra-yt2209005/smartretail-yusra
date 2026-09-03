@@ -32,3 +32,11 @@ def test_question_with_null_character_is_rejected():
         )
 
 
+def test_question_over_max_length_is_rejected():
+    with pytest.raises(
+        ValidationError
+    ):
+        AssistantRequest(
+            question="a" * 501
+        )
+

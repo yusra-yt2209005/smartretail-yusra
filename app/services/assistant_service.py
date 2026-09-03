@@ -1,7 +1,10 @@
 from __future__ import annotations
-import re 
-from typing import Any
+
+import asyncio
+import re
 import time
+from collections.abc import AsyncIterator
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -16,6 +19,7 @@ from app.schemas.assistant import (
     AssistantResponse,
 )
 from app.services.search_service import (
+    find_buyable_product_by_name,
     search_products,
 )
 
@@ -29,6 +33,12 @@ from app.ai.prompts import (
 )
 from app.services.ai_interaction_service import (
     record_ai_interaction,
+)
+from app.core.logging import get_logger
+
+
+logger = get_logger(
+    "smartretail.ai.assistant"
 )
 
 NO_RESULTS_MESSAGE = (
@@ -165,9 +175,14 @@ def _persist_interaction(
     started_at: float,
     input_tokens: int = 0,
     output_tokens: int = 0,
+    status: str | None = None,
+    correlation_id: str | None = None,
 ) -> None:
     """
     Persist metadata for one assistant interaction.
+
+    Streaming requests may explicitly use statuses such as
+    completed, truncated, failed, or refused.
     """
 
     products = products or []
@@ -187,17 +202,23 @@ def _persist_interaction(
         - started_at
     ) * 1000
 
+    interaction_status = (
+        status
+        if status is not None
+        else (
+            "refused"
+            if response.refused
+            else "completed"
+        )
+    )
+
     record_ai_interaction(
         db,
         question=question,
         intent=response.intent.value,
         answer=response.answer,
         refused=response.refused,
-        status=(
-            "refused"
-            if response.refused
-            else "completed"
-        ),
+        status=interaction_status,
         prompt_version=(
             response.prompt_version
         ),
@@ -207,7 +228,56 @@ def _persist_interaction(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         latency_ms=latency_ms,
+        correlation_id=correlation_id,
     )
+
+def extract_comparison_targets(
+    question: str,
+) -> tuple[str, str] | None:
+    """
+    Extract the two product names from a natural-language
+    comparison question.
+
+    Supported examples:
+    - Compare Galaxy A56 and Galaxy S25
+    - Compare Galaxy A56 with Galaxy S25
+    - Galaxy A56 vs Galaxy S25
+    - Galaxy A56 versus Galaxy S25
+    - Difference between Galaxy A56 and Galaxy S25
+    """
+
+    question = question.strip()
+
+    patterns = (
+        r"^compare\s+(.+?)\s+(?:and|with|vs\.?|versus)\s+(.+?)[?.!]*$",
+        r"^(.+?)\s+(?:vs\.?|versus)\s+(.+?)[?.!]*$",
+        r"^differences?\s+between\s+(.+?)\s+and\s+(.+?)[?.!]*$",
+    )
+
+    for pattern in patterns:
+        match = re.match(
+            pattern,
+            question,
+            flags=re.IGNORECASE,
+        )
+
+        if match:
+            first = (
+                match.group(1)
+                .strip()
+                .strip("?.!,")
+            )
+
+            second = (
+                match.group(2)
+                .strip()
+                .strip("?.!,")
+            )
+
+            if first and second:
+                return first, second
+
+    return None
 
 def detect_intent(
     question: str,
@@ -409,32 +479,31 @@ async def ask_comparison(
     llm: LLMProvider | None = None,
 ) -> AssistantResponse:
     """
-    Compare products using natural-language retrieval.
+    Compare two specifically named, currently buyable products.
 
-    The customer supplies product names or descriptions rather
-    than internal product UUIDs.
+    The customer supplies natural-language product names rather
+    than internal UUIDs.
     """
 
-    # Start measuring total comparison-request latency.
     started_at = time.perf_counter()
 
     question = question.strip()
 
-    products = search_products(
-        db,
-        query=question,
-        top_k=top_k,
-        include_context=True,
+    # ---------------------------------------------------------
+    # 1. Extract the two names from the customer's question.
+    # ---------------------------------------------------------
+
+    targets = extract_comparison_targets(
+        question
     )
 
-    # A comparison requires at least two valid products.
-    if len(products) < 2:
+    if targets is None:
         response = AssistantResponse(
             question=question,
             answer=(
-                "I couldn't find at least two "
-                "currently available products "
-                "to compare."
+                "Please name two products to compare, "
+                "for example: "
+                "'Compare Galaxy A56 and Galaxy S25'."
             ),
             intent=(
                 AssistantIntent.COMPARISON
@@ -447,21 +516,140 @@ async def ask_comparison(
             model=None,
         )
 
-        # Persist the refused comparison.
-        # If one product was found, we still record that retrieved
-        # product even though there were not enough products to compare.
         _persist_interaction(
             db,
             question=question,
             response=response,
-            products=products,
+            products=[],
             started_at=started_at,
         )
 
         return response
 
-    # Use the two strongest retrieval matches for comparison.
-    compared_products = products[:2]
+    first_name, second_name = targets
+
+    # ---------------------------------------------------------
+    # 2. Resolve each named product independently.
+    # ---------------------------------------------------------
+
+    first_product = (
+        find_buyable_product_by_name(
+            db,
+            name=first_name,
+        )
+    )
+
+    second_product = (
+        find_buyable_product_by_name(
+            db,
+            name=second_name,
+        )
+    )
+
+    # ---------------------------------------------------------
+    # 3. Do not silently substitute missing products.
+    # ---------------------------------------------------------
+
+    missing_names: list[str] = []
+
+    if first_product is None:
+        missing_names.append(
+            first_name
+        )
+
+    if second_product is None:
+        missing_names.append(
+            second_name
+        )
+
+    if missing_names:
+        missing_text = ", ".join(
+            missing_names
+        )
+
+        response = AssistantResponse(
+            question=question,
+            answer=(
+                "I couldn't find the following "
+                "currently buyable product(s): "
+                f"{missing_text}."
+            ),
+            intent=(
+                AssistantIntent.COMPARISON
+            ),
+            citations=[],
+            refused=True,
+            prompt_version=(
+                COMPARISON_PROMPT_VERSION
+            ),
+            model=None,
+        )
+
+        found_products = [
+            product
+            for product in (
+                first_product,
+                second_product,
+            )
+            if product is not None
+        ]
+
+        _persist_interaction(
+            db,
+            question=question,
+            response=response,
+            products=found_products,
+            started_at=started_at,
+        )
+
+        return response
+
+    # ---------------------------------------------------------
+    # 4. Prevent comparing one resolved product with itself.
+    # ---------------------------------------------------------
+
+    if (
+        first_product["product_id"]
+        == second_product["product_id"]
+    ):
+        response = AssistantResponse(
+            question=question,
+            answer=(
+                "Both names resolved to the same product. "
+                "Please name two different products to compare."
+            ),
+            intent=(
+                AssistantIntent.COMPARISON
+            ),
+            citations=[],
+            refused=True,
+            prompt_version=(
+                COMPARISON_PROMPT_VERSION
+            ),
+            model=None,
+        )
+
+        _persist_interaction(
+            db,
+            question=question,
+            response=response,
+            products=[
+                first_product
+            ],
+            started_at=started_at,
+        )
+
+        return response
+
+    # These are the exact two products named by the customer.
+    compared_products = [
+        first_product,
+        second_product,
+    ]
+
+    # ---------------------------------------------------------
+    # 5. Build grounded comparison context.
+    # ---------------------------------------------------------
 
     prompt_products = (
         _build_prompt_products(
@@ -505,8 +693,10 @@ async def ask_comparison(
         model=result.model,
     )
 
-    # Persist the successful comparison together with the exact
-    # two products that were supplied to the LLM.
+    # ---------------------------------------------------------
+    # 6. Persist exactly the two products actually compared.
+    # ---------------------------------------------------------
+
     _persist_interaction(
         db,
         question=question,
@@ -721,3 +911,633 @@ def contains_prompt_injection(
         pattern in normalized
         for pattern in PROMPT_INJECTION_PATTERNS
     )
+
+async def stream_assistant(
+    db: Session,
+    *,
+    question: str,
+    top_k: int = 5,
+    llm: LLMProvider | None = None,
+    correlation_id: str | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """
+    Stream a grounded SmartRetail assistant response.
+
+    Event order:
+        text...
+        citations
+        done
+
+    The LLM provider itself supplies incremental text.
+    """
+
+    started_at = time.perf_counter()
+    question = question.strip()
+
+    # ---------------------------------------------------------
+    # 1. Reject direct prompt-injection attempts before retrieval.
+    # ---------------------------------------------------------
+
+    if contains_prompt_injection(
+        question
+    ):
+        response = AssistantResponse(
+            question=question,
+            answer=UNSAFE_INPUT_MESSAGE,
+            intent=AssistantIntent.DISCOVERY,
+            citations=[],
+            refused=True,
+            prompt_version=None,
+            model=None,
+        )
+
+        _persist_interaction(
+            db,
+            question=question,
+            response=response,
+            products=[],
+            started_at=started_at,
+            status="refused",
+            correlation_id=correlation_id,
+        )
+
+        yield {
+            "type": "text",
+            "text": UNSAFE_INPUT_MESSAGE,
+        }
+
+        yield {
+            "type": "citations",
+            "citations": [],
+        }
+
+        yield {
+            "type": "done",
+            "status": "refused",
+            "model": None,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+
+        return
+
+    # ---------------------------------------------------------
+    # 2. Detect intent and prepare grounded context.
+    # ---------------------------------------------------------
+
+    intent = detect_intent(
+        question
+    )
+
+    products: list[
+        dict[str, Any]
+    ] = []
+
+    # ---------------------------------------------------------
+    # COMPARISON
+    # ---------------------------------------------------------
+
+    if (
+        intent
+        == AssistantIntent.COMPARISON
+    ):
+        targets = extract_comparison_targets(
+            question
+        )
+
+        if targets is None:
+            refusal_message = (
+                "Please name two products to compare, "
+                "for example: "
+                "'Compare Galaxy A56 and Galaxy S25'."
+            )
+
+            response = AssistantResponse(
+                question=question,
+                answer=refusal_message,
+                intent=AssistantIntent.COMPARISON,
+                citations=[],
+                refused=True,
+                prompt_version=(
+                    COMPARISON_PROMPT_VERSION
+                ),
+                model=None,
+            )
+
+            _persist_interaction(
+                db,
+                question=question,
+                response=response,
+                products=[],
+                started_at=started_at,
+                status="refused",
+                correlation_id=correlation_id,
+            )
+
+            yield {
+                "type": "text",
+                "text": refusal_message,
+            }
+
+            yield {
+                "type": "citations",
+                "citations": [],
+            }
+
+            yield {
+                "type": "done",
+                "status": "refused",
+                "model": None,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            }
+
+            return
+
+        first_name, second_name = targets
+
+        first_product = (
+            find_buyable_product_by_name(
+                db,
+                name=first_name,
+            )
+        )
+
+        second_product = (
+            find_buyable_product_by_name(
+                db,
+                name=second_name,
+            )
+        )
+
+        missing_names: list[str] = []
+
+        if first_product is None:
+            missing_names.append(
+                first_name
+            )
+
+        if second_product is None:
+            missing_names.append(
+                second_name
+            )
+
+        if missing_names:
+            refusal_message = (
+                "I couldn't find the following "
+                "currently buyable product(s): "
+                + ", ".join(missing_names)
+                + "."
+            )
+
+            found_products = [
+                product
+                for product in (
+                    first_product,
+                    second_product,
+                )
+                if product is not None
+            ]
+
+            response = AssistantResponse(
+                question=question,
+                answer=refusal_message,
+                intent=AssistantIntent.COMPARISON,
+                citations=[],
+                refused=True,
+                prompt_version=(
+                    COMPARISON_PROMPT_VERSION
+                ),
+                model=None,
+            )
+
+            _persist_interaction(
+                db,
+                question=question,
+                response=response,
+                products=found_products,
+                started_at=started_at,
+                status="refused",
+                correlation_id=correlation_id,
+            )
+
+            yield {
+                "type": "text",
+                "text": refusal_message,
+            }
+
+            yield {
+                "type": "citations",
+                "citations": [],
+            }
+
+            yield {
+                "type": "done",
+                "status": "refused",
+                "model": None,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            }
+
+            return
+
+        if (
+            first_product["product_id"]
+            == second_product["product_id"]
+        ):
+            refusal_message = (
+                "Both names resolved to the same product. "
+                "Please name two different products to compare."
+            )
+
+            response = AssistantResponse(
+                question=question,
+                answer=refusal_message,
+                intent=AssistantIntent.COMPARISON,
+                citations=[],
+                refused=True,
+                prompt_version=(
+                    COMPARISON_PROMPT_VERSION
+                ),
+                model=None,
+            )
+
+            _persist_interaction(
+                db,
+                question=question,
+                response=response,
+                products=[
+                    first_product
+                ],
+                started_at=started_at,
+                status="refused",
+                correlation_id=correlation_id,
+            )
+
+            yield {
+                "type": "text",
+                "text": refusal_message,
+            }
+
+            yield {
+                "type": "citations",
+                "citations": [],
+            }
+
+            yield {
+                "type": "done",
+                "status": "refused",
+                "model": None,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            }
+
+            return
+
+        products = [
+            first_product,
+            second_product,
+        ]
+
+        prompt_products = (
+            _build_prompt_products(
+                products
+            )
+        )
+
+        system_prompt, user_prompt = (
+            build_comparison_prompt(
+                question,
+                prompt_products,
+            )
+        )
+
+        prompt_version = (
+            COMPARISON_PROMPT_VERSION
+        )
+
+    # ---------------------------------------------------------
+    # GUIDANCE
+    # ---------------------------------------------------------
+
+    elif (
+        intent
+        == AssistantIntent.GUIDANCE
+    ):
+        retrieval_query = (
+            build_retrieval_query(
+                question,
+                AssistantIntent.GUIDANCE,
+            )
+        )
+
+        products = search_products(
+            db,
+            query=retrieval_query,
+            top_k=top_k,
+            include_context=True,
+        )
+
+        if not products:
+            refusal_message = (
+                "I couldn't find any currently available "
+                "products that match your needs."
+            )
+
+            response = AssistantResponse(
+                question=question,
+                answer=refusal_message,
+                intent=AssistantIntent.GUIDANCE,
+                citations=[],
+                refused=True,
+                prompt_version=(
+                    GUIDANCE_PROMPT_VERSION
+                ),
+                model=None,
+            )
+
+            _persist_interaction(
+                db,
+                question=question,
+                response=response,
+                products=[],
+                started_at=started_at,
+                status="refused",
+                correlation_id=correlation_id,
+            )
+
+            yield {
+                "type": "text",
+                "text": refusal_message,
+            }
+
+            yield {
+                "type": "citations",
+                "citations": [],
+            }
+
+            yield {
+                "type": "done",
+                "status": "refused",
+                "model": None,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            }
+
+            return
+
+        prompt_products = (
+            _build_prompt_products(
+                products
+            )
+        )
+
+        system_prompt, user_prompt = (
+            build_guidance_prompt(
+                question,
+                prompt_products,
+            )
+        )
+
+        prompt_version = (
+            GUIDANCE_PROMPT_VERSION
+        )
+
+    # ---------------------------------------------------------
+    # DISCOVERY
+    # ---------------------------------------------------------
+
+    else:
+        products = search_products(
+            db,
+            query=question,
+            top_k=top_k,
+            include_context=True,
+        )
+
+        if not products:
+            response = AssistantResponse(
+                question=question,
+                answer=NO_RESULTS_MESSAGE,
+                intent=AssistantIntent.DISCOVERY,
+                citations=[],
+                refused=True,
+                prompt_version=(
+                    DISCOVERY_PROMPT_VERSION
+                ),
+                model=None,
+            )
+
+            _persist_interaction(
+                db,
+                question=question,
+                response=response,
+                products=[],
+                started_at=started_at,
+                status="refused",
+                correlation_id=correlation_id,
+            )
+
+            yield {
+                "type": "text",
+                "text": NO_RESULTS_MESSAGE,
+            }
+
+            yield {
+                "type": "citations",
+                "citations": [],
+            }
+
+            yield {
+                "type": "done",
+                "status": "refused",
+                "model": None,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            }
+
+            return
+
+        prompt_products = (
+            _build_prompt_products(
+                products
+            )
+        )
+
+        system_prompt, user_prompt = (
+            build_discovery_prompt(
+                question,
+                prompt_products,
+            )
+        )
+
+        prompt_version = (
+            DISCOVERY_PROMPT_VERSION
+        )
+
+    # ---------------------------------------------------------
+    # 3. Stream from the provider.
+    # ---------------------------------------------------------
+
+    provider = (
+        llm
+        if llm is not None
+        else get_llm_provider()
+    )
+
+    citations = _build_citations(
+        products
+    )
+
+    answer_parts: list[str] = []
+
+    input_tokens = 0
+    output_tokens = 0
+
+    persisted = False
+
+    try:
+        async for event in provider.stream(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        ):
+            if event.done:
+                input_tokens = (
+                    event.input_tokens
+                    or 0
+                )
+
+                output_tokens = (
+                    event.output_tokens
+                    or 0
+                )
+
+                break
+
+            if event.text:
+                answer_parts.append(
+                    event.text
+                )
+
+                yield {
+                    "type": "text",
+                    "text": event.text,
+                }
+
+        full_answer = "".join(
+            answer_parts
+        )
+
+        response = AssistantResponse(
+            question=question,
+            answer=full_answer,
+            intent=intent,
+            citations=citations,
+            refused=False,
+            prompt_version=prompt_version,
+            model=provider.model_name,
+        )
+
+        _persist_interaction(
+            db,
+            question=question,
+            response=response,
+            products=products,
+            started_at=started_at,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            status="completed",
+            correlation_id=correlation_id,
+        )
+
+        persisted = True
+
+        # Citations MUST come after all text.
+        yield {
+            "type": "citations",
+            "citations": [
+                citation.model_dump(
+                    mode="json"
+                )
+                for citation in citations
+            ],
+        }
+
+        # Terminal event MUST be last.
+        yield {
+            "type": "done",
+            "status": "completed",
+            "model": provider.model_name,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+
+    except asyncio.CancelledError:
+        # Client disconnected while the provider was still streaming.
+        if not persisted:
+            partial_answer = "".join(
+                answer_parts
+            )
+
+            response = AssistantResponse(
+                question=question,
+                answer=partial_answer,
+                intent=intent,
+                citations=citations,
+                refused=False,
+                prompt_version=prompt_version,
+                model=provider.model_name,
+            )
+
+            _persist_interaction(
+                db,
+                question=question,
+                response=response,
+                products=products,
+                started_at=started_at,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                status="truncated",
+                correlation_id=correlation_id,
+            )
+
+            logger.warning(
+                "AI stream disconnected; partial response persisted"
+            )
+
+        raise
+
+    except Exception:
+        # Persist a partial answer if the provider itself fails.
+        if not persisted:
+            partial_answer = "".join(
+                answer_parts
+            )
+
+            response = AssistantResponse(
+                question=question,
+                answer=partial_answer,
+                intent=intent,
+                citations=citations,
+                refused=False,
+                prompt_version=prompt_version,
+                model=provider.model_name,
+            )
+
+            _persist_interaction(
+                db,
+                question=question,
+                response=response,
+                products=products,
+                started_at=started_at,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                status="failed",
+                correlation_id=correlation_id,
+            )
+
+        logger.exception(
+            "AI stream failed"
+        )
+
+        raise
