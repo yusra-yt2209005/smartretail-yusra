@@ -4,7 +4,9 @@ from decimal import Decimal
 
 from app.ai.llm import FakeLLM
 from app.services import assistant_service
-
+from app.schemas.assistant import (
+    AssistantIntent,
+)
 
 PRODUCT_ID = uuid.uuid4()
 VARIANT_ID = uuid.uuid4()
@@ -222,4 +224,170 @@ def test_discovery_uses_requested_top_k(
     assert (
         captured["include_context"]
         is True
+    )
+
+
+def test_detects_comparison_intent():
+    assert (
+        assistant_service.detect_intent(
+            "Compare Galaxy A56 and Galaxy S25"
+        )
+        == AssistantIntent.COMPARISON
+    )
+
+    assert (
+        assistant_service.detect_intent(
+            "Galaxy A56 vs Galaxy S25"
+        )
+        == AssistantIntent.COMPARISON
+    )
+
+
+def test_defaults_to_discovery_intent():
+    assert (
+        assistant_service.detect_intent(
+            "I need a Samsung phone"
+        )
+        == AssistantIntent.DISCOVERY
+    )
+
+def test_comparison_calls_llm_with_two_products(
+    monkeypatch,
+):
+    second_product = {
+        **_fake_products()[0],
+        "product_id": uuid.uuid4(),
+        "variant_id": uuid.uuid4(),
+        "title": "Second Phone",
+        "price": Decimal("1299.99"),
+    }
+
+    products = [
+        _fake_products()[0],
+        second_product,
+    ]
+
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        lambda *args, **kwargs: products,
+    )
+
+    llm = FakeLLM(
+        response_text=(
+            "Comparison response."
+        )
+    )
+
+    response = asyncio.run(
+        assistant_service.ask_comparison(
+            db=None,
+            question=(
+                "Compare Demo Phone "
+                "and Second Phone"
+            ),
+            llm=llm,
+        )
+    )
+
+    assert response.refused is False
+
+    assert (
+        response.intent
+        == AssistantIntent.COMPARISON
+    )
+
+    assert len(response.citations) == 2
+    assert len(llm.calls) == 1
+
+    user_prompt = (
+        llm.calls[0]["user_prompt"]
+    )
+
+    assert "Demo Phone" in user_prompt
+    assert "Second Phone" in user_prompt
+
+
+def test_comparison_refuses_when_fewer_than_two_products(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        lambda *args, **kwargs: (
+            _fake_products()
+        ),
+    )
+
+    llm = FakeLLM(
+        response_text=(
+            "This should not be used."
+        )
+    )
+
+    response = asyncio.run(
+        assistant_service.ask_comparison(
+            db=None,
+            question=(
+                "Compare Demo Phone "
+                "with another phone"
+            ),
+            llm=llm,
+        )
+    )
+
+    assert response.refused is True
+
+    assert (
+        response.intent
+        == AssistantIntent.COMPARISON
+    )
+
+    assert response.citations == []
+
+    assert len(llm.calls) == 0
+
+def test_comparison_uses_top_two_results(
+    monkeypatch,
+):
+    products = []
+
+    for index in range(3):
+        product = {
+            **_fake_products()[0],
+            "product_id": uuid.uuid4(),
+            "variant_id": uuid.uuid4(),
+            "title": f"Phone {index + 1}",
+        }
+
+        products.append(product)
+
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        lambda *args, **kwargs: products,
+    )
+
+    llm = FakeLLM(
+        response_text="Comparison."
+    )
+
+    response = asyncio.run(
+        assistant_service.ask_comparison(
+            db=None,
+            question="Compare phones",
+            llm=llm,
+        )
+    )
+
+    assert len(response.citations) == 2
+
+    assert (
+        response.citations[0].title
+        == "Phone 1"
+    )
+
+    assert (
+        response.citations[1].title
+        == "Phone 2"
     )

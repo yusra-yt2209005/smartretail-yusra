@@ -1,7 +1,12 @@
 import uuid
 from decimal import Decimal
+from enum import Enum
 
 from pydantic import BaseModel, Field
+
+class AssistantIntent(str, Enum):
+    DISCOVERY = "discovery"
+    COMPARISON = "comparison"
 
 
 class AssistantRequest(BaseModel):
@@ -40,6 +45,8 @@ class AssistantResponse(BaseModel):
     question: str
     answer: str
 
+    intent: AssistantIntent
+
     citations: list[
         AssistantCitation
     ] = []
@@ -49,3 +56,4 @@ class AssistantResponse(BaseModel):
     prompt_version: str | None = None
 
     model: str | None = None
+

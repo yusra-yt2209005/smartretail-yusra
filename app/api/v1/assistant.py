@@ -4,13 +4,17 @@ from fastapi import (
 )
 from sqlalchemy.orm import Session
 
+from app.services.assistant_service import (
+    ask_discovery,
+)
+
 from app.db.session import get_db
 from app.schemas.assistant import (
     AssistantRequest,
     AssistantResponse,
 )
 from app.services.assistant_service import (
-    ask_discovery,
+    ask_assistant as ask_assistant_service,
 )
 
 
@@ -31,10 +35,10 @@ async def ask_assistant(
     ),
 ) -> AssistantResponse:
     """
-    Ask the SmartRetail assistant a product-discovery question.
+    Ask the SmartRetail shopping assistant.
     """
 
-    return await ask_discovery(
+    return await ask_assistant_service(
         db,
         question=data.question,
         top_k=data.top_k,
