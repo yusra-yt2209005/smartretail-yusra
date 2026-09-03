@@ -1,6 +1,7 @@
 from __future__ import annotations
 import re 
 from typing import Any
+import time
 
 from sqlalchemy.orm import Session
 
@@ -26,7 +27,9 @@ from app.ai.prompts import (
     build_discovery_prompt,
     build_guidance_prompt,
 )
-
+from app.services.ai_interaction_service import (
+    record_ai_interaction,
+)
 
 NO_RESULTS_MESSAGE = (
     "I couldn't find any currently available products "
@@ -153,7 +156,58 @@ def _build_citations(
         for product in products
     ]
 
+def _persist_interaction(
+    db: Session,
+    *,
+    question: str,
+    response: AssistantResponse,
+    products: list[dict[str, Any]] | None,
+    started_at: float,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> None:
+    """
+    Persist metadata for one assistant interaction.
+    """
 
+    products = products or []
+
+    product_ids = [
+        str(product["product_id"])
+        for product in products
+    ]
+
+    variant_ids = [
+        str(product["variant_id"])
+        for product in products
+    ]
+
+    latency_ms = (
+        time.perf_counter()
+        - started_at
+    ) * 1000
+
+    record_ai_interaction(
+        db,
+        question=question,
+        intent=response.intent.value,
+        answer=response.answer,
+        refused=response.refused,
+        status=(
+            "refused"
+            if response.refused
+            else "completed"
+        ),
+        prompt_version=(
+            response.prompt_version
+        ),
+        model=response.model,
+        product_ids=product_ids,
+        variant_ids=variant_ids,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        latency_ms=latency_ms,
+    )
 
 def detect_intent(
     question: str,
@@ -256,7 +310,7 @@ async def ask_discovery(
     Retrieval happens first. If no valid buyable products are found,
     return a refusal without calling the LLM.
     """
-
+    started_at = time.perf_counter()
     question = question.strip()
 
     products = search_products(
@@ -272,7 +326,7 @@ async def ask_discovery(
     # ---------------------------------------------------------
 
     if not products:
-        return AssistantResponse(
+        response = AssistantResponse(
             question=question,
             answer=NO_RESULTS_MESSAGE,
             intent=AssistantIntent.DISCOVERY,
@@ -283,6 +337,16 @@ async def ask_discovery(
             ),
             model=None,
         )
+
+        _persist_interaction(
+            db,
+            question=question,
+            response=response,
+            products=[],
+            started_at=started_at,
+        )
+
+        return response
 
     prompt_products = (
         _build_prompt_products(
@@ -308,11 +372,12 @@ async def ask_discovery(
         user_prompt=user_prompt,
     )
 
+    
     citations = _build_citations(
         products
     )
 
-    return AssistantResponse(
+    response = AssistantResponse(
         question=question,
         answer=result.text,
         intent=AssistantIntent.DISCOVERY,
@@ -323,6 +388,18 @@ async def ask_discovery(
         ),
         model=result.model,
     )
+
+    _persist_interaction(
+        db,
+        question=question,
+        response=response,
+        products=products,
+        started_at=started_at,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+    )
+
+    return response
 
 async def ask_comparison(
     db: Session,
@@ -338,6 +415,9 @@ async def ask_comparison(
     than internal product UUIDs.
     """
 
+    # Start measuring total comparison-request latency.
+    started_at = time.perf_counter()
+
     question = question.strip()
 
     products = search_products(
@@ -349,7 +429,7 @@ async def ask_comparison(
 
     # A comparison requires at least two valid products.
     if len(products) < 2:
-        return AssistantResponse(
+        response = AssistantResponse(
             question=question,
             answer=(
                 "I couldn't find at least two "
@@ -367,8 +447,20 @@ async def ask_comparison(
             model=None,
         )
 
-    # For this comparison task, use the two strongest
-    # retrieval matches.
+        # Persist the refused comparison.
+        # If one product was found, we still record that retrieved
+        # product even though there were not enough products to compare.
+        _persist_interaction(
+            db,
+            question=question,
+            response=response,
+            products=products,
+            started_at=started_at,
+        )
+
+        return response
+
+    # Use the two strongest retrieval matches for comparison.
     compared_products = products[:2]
 
     prompt_products = (
@@ -399,7 +491,7 @@ async def ask_comparison(
         compared_products
     )
 
-    return AssistantResponse(
+    response = AssistantResponse(
         question=question,
         answer=result.text,
         intent=(
@@ -413,6 +505,20 @@ async def ask_comparison(
         model=result.model,
     )
 
+    # Persist the successful comparison together with the exact
+    # two products that were supplied to the LLM.
+    _persist_interaction(
+        db,
+        question=question,
+        response=response,
+        products=compared_products,
+        started_at=started_at,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+    )
+
+    return response
+
 async def ask_assistant(
     db: Session,
     *,
@@ -425,12 +531,14 @@ async def ask_assistant(
     assistant behavior.
     """
 
+    started_at = time.perf_counter()
+
     question = question.strip()
 
     if contains_prompt_injection(
         question
     ):
-        return AssistantResponse(
+        response = AssistantResponse(
             question=question,
             answer=UNSAFE_INPUT_MESSAGE,
             intent=AssistantIntent.DISCOVERY,
@@ -439,6 +547,16 @@ async def ask_assistant(
             prompt_version=None,
             model=None,
         )
+
+        _persist_interaction(
+            db,
+            question=question,
+            response=response,
+            products=[],
+            started_at=started_at,
+        )
+
+        return response
 
     intent = detect_intent(
         question
@@ -485,6 +603,9 @@ async def ask_guidance(
     products retrieved from the catalog.
     """
 
+    # Start measuring this guidance request's total latency.
+    started_at = time.perf_counter()
+
     question = question.strip()
 
     retrieval_query = build_retrieval_query(
@@ -499,10 +620,10 @@ async def ask_guidance(
         include_context=True,
     )
 
-    # Buying advice must never be invented when retrieval
-    # returns no valid products.
+    # If retrieval returns no valid products, refuse without
+    # calling the LLM, but still persist the interaction.
     if not products:
-        return AssistantResponse(
+        response = AssistantResponse(
             question=question,
             answer=(
                 "I couldn't find any currently available "
@@ -516,6 +637,16 @@ async def ask_guidance(
             ),
             model=None,
         )
+
+        _persist_interaction(
+            db,
+            question=question,
+            response=response,
+            products=[],
+            started_at=started_at,
+        )
+
+        return response
 
     prompt_products = (
         _build_prompt_products(
@@ -545,7 +676,7 @@ async def ask_guidance(
         products
     )
 
-    return AssistantResponse(
+    response = AssistantResponse(
         question=question,
         answer=result.text,
         intent=AssistantIntent.GUIDANCE,
@@ -556,6 +687,19 @@ async def ask_guidance(
         ),
         model=result.model,
     )
+
+    # Save the successful guidance request after generation.
+    _persist_interaction(
+        db,
+        question=question,
+        response=response,
+        products=products,
+        started_at=started_at,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+    )
+
+    return response
 
 def contains_prompt_injection(
     question: str,

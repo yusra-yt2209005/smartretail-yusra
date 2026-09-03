@@ -7,7 +7,7 @@ from app.services import assistant_service
 from app.schemas.assistant import (
     AssistantIntent,
 )
-
+import pytest
 PRODUCT_ID = uuid.uuid4()
 VARIANT_ID = uuid.uuid4()
 
@@ -629,3 +629,18 @@ def test_prompt_injection_does_not_call_search_or_llm(
 
     assert search_called is False
     assert len(llm.calls) == 0
+
+@pytest.fixture(autouse=True)
+def disable_ai_interaction_persistence(
+    monkeypatch,
+):
+    """
+    Existing assistant unit tests focus on assistant behavior,
+    not PostgreSQL persistence.
+    """
+
+    monkeypatch.setattr(
+        assistant_service,
+        "_persist_interaction",
+        lambda *args, **kwargs: None,
+    )
