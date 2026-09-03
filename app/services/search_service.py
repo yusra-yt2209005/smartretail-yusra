@@ -45,6 +45,7 @@ def search_products(
     query: str,
     top_k: int | None = None,
     threshold: float | None = None,
+    include_context: bool = False,
 ) -> list[dict]:
     """
     Return the most semantically relevant buyable products.
@@ -144,6 +145,9 @@ def search_products(
             Product.title,
             Product.category_id,
             ranked_variants.c.price,
+            ContentChunk.text.label(
+                "context_text"
+            ),
             distance.label(
                 "distance"
             ),
@@ -214,24 +218,31 @@ def search_products(
         if similarity < threshold:
             continue
 
-        results.append(
-            {
-                "product_id": (
-                    row.product_id
-                ),
-                "variant_id": (
-                    row.variant_id
-                ),
-                "title": row.title,
-                "category_id": (
-                    row.category_id
-                ),
-                "price": row.price,
-                "similarity": round(
-                    similarity,
-                    4,
-                ),
-            }
-        )
+
+
+        result = {
+            "product_id": (
+                row.product_id
+            ),
+            "variant_id": (
+                row.variant_id
+            ),
+            "title": row.title,
+            "category_id": (
+                row.category_id
+            ),
+            "price": row.price,
+            "similarity": round(
+                similarity,
+                4,
+            ),
+        }
+
+        if include_context:
+            result["context_text"] = (
+                row.context_text
+            )
+
+        results.append(result)
 
     return results

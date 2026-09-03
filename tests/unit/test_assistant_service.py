@@ -1,0 +1,225 @@
+import asyncio
+import uuid
+from decimal import Decimal
+
+from app.ai.llm import FakeLLM
+from app.services import assistant_service
+
+
+PRODUCT_ID = uuid.uuid4()
+VARIANT_ID = uuid.uuid4()
+
+
+def _fake_products():
+    return [
+        {
+            "product_id": PRODUCT_ID,
+            "variant_id": VARIANT_ID,
+            "title": "Demo Phone",
+            "category_id": uuid.uuid4(),
+            "price": Decimal("999.99"),
+            "similarity": 0.91,
+            "context_text": (
+                "Title: Demo Phone\n"
+                "Category: Phones\n"
+                "Specifications: storage 256GB\n"
+                "Description: Demo smartphone."
+            ),
+        }
+    ]
+
+
+def test_discovery_calls_llm_when_products_found(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        lambda *args, **kwargs: (
+            _fake_products()
+        ),
+    )
+
+    llm = FakeLLM(
+        response_text=(
+            "The Demo Phone matches "
+            "your request."
+        )
+    )
+
+    response = asyncio.run(
+        assistant_service.ask_discovery(
+            db=None,
+            question="I need a phone",
+            llm=llm,
+        )
+    )
+
+    assert response.refused is False
+
+    assert response.answer == (
+        "The Demo Phone matches "
+        "your request."
+    )
+
+    assert len(response.citations) == 1
+
+    assert (
+        response.citations[0].product_id
+        == PRODUCT_ID
+    )
+
+    assert len(llm.calls) == 1
+
+
+def test_discovery_does_not_call_llm_when_no_products(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        lambda *args, **kwargs: [],
+    )
+
+    llm = FakeLLM(
+        response_text=(
+            "This must not be used."
+        )
+    )
+
+    response = asyncio.run(
+        assistant_service.ask_discovery(
+            db=None,
+            question=(
+                "Find something impossible"
+            ),
+            llm=llm,
+        )
+    )
+
+    assert response.refused is True
+    assert response.citations == []
+
+    # Critical Part B requirement:
+    # retrieval failure must not call the LLM.
+    assert len(llm.calls) == 0
+
+
+def test_discovery_prompt_contains_retrieved_product(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        lambda *args, **kwargs: (
+            _fake_products()
+        ),
+    )
+
+    llm = FakeLLM(
+        response_text="Grounded answer."
+    )
+
+    asyncio.run(
+        assistant_service.ask_discovery(
+            db=None,
+            question=(
+                "Show me a 256GB phone"
+            ),
+            llm=llm,
+        )
+    )
+
+    assert len(llm.calls) == 1
+
+    user_prompt = (
+        llm.calls[0]["user_prompt"]
+    )
+
+    assert "Demo Phone" in user_prompt
+    assert "256GB" in user_prompt
+    assert str(PRODUCT_ID) in user_prompt
+
+
+def test_citations_are_built_from_retrieval(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        lambda *args, **kwargs: (
+            _fake_products()
+        ),
+    )
+
+    llm = FakeLLM(
+        response_text=(
+            "Some arbitrary generated text."
+        )
+    )
+
+    response = asyncio.run(
+        assistant_service.ask_discovery(
+            db=None,
+            question="phone",
+            llm=llm,
+        )
+    )
+
+    citation = response.citations[0]
+
+    assert citation.title == "Demo Phone"
+
+    assert citation.price == Decimal(
+        "999.99"
+    )
+
+    assert (
+        citation.variant_id
+        == VARIANT_ID
+    )
+
+
+def test_discovery_uses_requested_top_k(
+    monkeypatch,
+):
+    captured = {}
+
+    def fake_search(
+        db,
+        *,
+        query,
+        top_k,
+        include_context,
+    ):
+        captured["query"] = query
+        captured["top_k"] = top_k
+        captured[
+            "include_context"
+        ] = include_context
+
+        return _fake_products()
+
+    monkeypatch.setattr(
+        assistant_service,
+        "search_products",
+        fake_search,
+    )
+
+    llm = FakeLLM()
+
+    asyncio.run(
+        assistant_service.ask_discovery(
+            db=None,
+            question="phone",
+            top_k=3,
+            llm=llm,
+        )
+    )
+
+    assert captured["query"] == "phone"
+    assert captured["top_k"] == 3
+    assert (
+        captured["include_context"]
+        is True
+    )
