@@ -50,3 +50,27 @@ class AnalyticsReconciliationOut(BaseModel):
     raw: ReconciliationValues
     drift: ReconciliationDrift
     matches: bool
+
+class AIIntentBreakdown(BaseModel):
+    discovery: int = 0
+    comparison: int = 0
+    guidance: int = 0
+    merchant_content: int = 0
+
+
+class AIAnalyticsOut(BaseModel):
+    questions_asked: int
+    answered: int
+    refused: int
+
+    intent_breakdown: AIIntentBreakdown
+
+    average_latency_ms: float
+    p95_latency_ms: float
+
+    total_input_tokens: int
+    total_output_tokens: int
+    total_tokens: int
+
+    conversions_after_ai: int
+    conversion_rate: float

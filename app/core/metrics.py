@@ -49,3 +49,43 @@ EVENTS_FAILED_TOTAL = Counter(
     "Total number of Kafka events that failed processing",
     ["event_type"],
 )
+
+# ---------------------------------------------------------------------
+# Week 5: AI metrics
+# ---------------------------------------------------------------------
+
+AI_REQUESTS_TOTAL = Counter(
+    "ai_requests_total",
+    "Total number of AI requests",
+    [
+        "intent",
+        "refused",
+    ],
+)
+
+
+AI_FAILURES_TOTAL = Counter(
+    "ai_failures_total",
+    "Total number of failed AI requests",
+    [
+        "intent",
+    ],
+)
+
+
+AI_REQUEST_LATENCY_SECONDS = Histogram(
+    "ai_request_latency_seconds",
+    "AI request latency in seconds",
+    [
+        "intent",
+    ],
+)
+
+
+AI_TOKENS_TOTAL = Counter(
+    "ai_tokens_total",
+    "Total number of AI tokens used",
+    [
+        "type",
+    ],
+)

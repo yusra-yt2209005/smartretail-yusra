@@ -124,3 +124,18 @@ def _product_list_key(
         f"v{version}:"
         f"{digest}"
     )
+
+def get_product_list_cache_version() -> int:
+    """
+    Return the current catalog cache version.
+
+    AI answer-cache keys use this version too, so changing the
+    catalog automatically makes older AI answers unreachable.
+    """
+
+    return int(
+        get_redis().get(
+            _VERSION_KEY
+        )
+        or 0
+    )

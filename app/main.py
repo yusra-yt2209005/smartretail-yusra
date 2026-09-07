@@ -4,12 +4,14 @@ from fastapi.exceptions import RequestValidationError
 
 from app.api.v1 import (
     analytics,
+    assistant,
     auth,
     categories,
     health,
     orders,
     products,
-    search
+    search,
+    merchant_content,
 )
 from app.core.exceptions import AppError
 import uuid
@@ -51,6 +53,9 @@ app.include_router(products.router)
 app.include_router(orders.router)
 app.include_router(analytics.router)
 app.include_router(search.router)
+app.include_router(assistant.router)
+app.include_router(merchant_content.router)
+
 @app.middleware("http")
 
 async def correlation_id_middleware(

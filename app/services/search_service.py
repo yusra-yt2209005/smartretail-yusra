@@ -45,6 +45,7 @@ def search_products(
     query: str,
     top_k: int | None = None,
     threshold: float | None = None,
+    include_context: bool = False,
 ) -> list[dict]:
     """
     Return the most semantically relevant buyable products.
@@ -144,6 +145,9 @@ def search_products(
             Product.title,
             Product.category_id,
             ranked_variants.c.price,
+            ContentChunk.text.label(
+                "context_text"
+            ),
             distance.label(
                 "distance"
             ),
@@ -214,24 +218,153 @@ def search_products(
         if similarity < threshold:
             continue
 
-        results.append(
-            {
-                "product_id": (
-                    row.product_id
-                ),
-                "variant_id": (
-                    row.variant_id
-                ),
-                "title": row.title,
-                "category_id": (
-                    row.category_id
-                ),
-                "price": row.price,
-                "similarity": round(
-                    similarity,
-                    4,
-                ),
-            }
-        )
+
+
+        result = {
+            "product_id": (
+                row.product_id
+            ),
+            "variant_id": (
+                row.variant_id
+            ),
+            "title": row.title,
+            "category_id": (
+                row.category_id
+            ),
+            "price": row.price,
+            "similarity": round(
+                similarity,
+                4,
+            ),
+        }
+
+        if include_context:
+            result["context_text"] = (
+                row.context_text
+            )
+
+        results.append(result)
 
     return results
+
+def find_buyable_product_by_name(
+    db: Session,
+    *,
+    name: str,
+) -> dict | None:
+    """
+    Resolve one named product from the currently buyable catalog.
+
+    This is used by comparison so a requested product cannot
+    silently be replaced by a different semantically similar product.
+    """
+
+    name = name.strip()
+
+    if not name:
+        return None
+
+    # Rank active, in-stock variants by price so we return one
+    # representative buyable variant for the product.
+    ranked_variants = (
+        select(
+            ProductVariant.id.label(
+                "variant_id"
+            ),
+            ProductVariant.product_id.label(
+                "product_id"
+            ),
+            ProductVariant.price.label(
+                "price"
+            ),
+            func.row_number()
+            .over(
+                partition_by=(
+                    ProductVariant.product_id
+                ),
+                order_by=(
+                    ProductVariant.price.asc(),
+                    ProductVariant.id.asc(),
+                ),
+            )
+            .label("variant_rank"),
+        )
+        .where(
+            ProductVariant.is_active.is_(
+                True
+            ),
+            ProductVariant.stock > 0,
+        )
+        .subquery()
+    )
+
+    stmt = (
+        select(
+            Product.id.label(
+                "product_id"
+            ),
+            ranked_variants.c.variant_id,
+            Product.title,
+            Product.category_id,
+            ranked_variants.c.price,
+            ContentChunk.text.label(
+                "context_text"
+            ),
+        )
+        .join(
+            ContentChunk,
+            ContentChunk.product_id
+            == Product.id,
+        )
+        .join(
+            ranked_variants,
+            and_(
+                ranked_variants.c.product_id
+                == Product.id,
+                ranked_variants.c.variant_rank
+                == 1,
+            ),
+        )
+        .where(
+            Product.status
+            == ProductStatus.PUBLISHED,
+
+            # The customer's supplied name must actually appear
+            # in the catalog title.
+            Product.title.ilike(
+                f"%{name}%"
+            ),
+
+            ContentChunk.status
+            == ProductStatus.PUBLISHED.value,
+
+            ContentChunk.available.is_(
+                True
+            ),
+
+            ContentChunk.in_stock.is_(
+                True
+            ),
+        )
+        .order_by(
+            Product.title.asc()
+        )
+        .limit(1)
+    )
+
+    row = db.execute(
+        stmt
+    ).first()
+
+    if row is None:
+        return None
+
+    return {
+        "product_id": row.product_id,
+        "variant_id": row.variant_id,
+        "title": row.title,
+        "category_id": row.category_id,
+        "price": row.price,
+        "similarity": 1.0,
+        "context_text": row.context_text,
+    }

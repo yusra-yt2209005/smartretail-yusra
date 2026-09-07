@@ -50,6 +50,34 @@ class Settings(BaseSettings):
     search_similarity_threshold: float = 0.20
 
 
+        # --- Week 5: LLM ---
+
+    # Which text-generation implementation to use.
+    # --- Week 5: LLM ---
+
+    llm_provider: str = "fake"
+
+    llm_model: str = "openai/gpt-oss-20b"
+
+    groq_api_key: str = ""
+
+    groq_base_url: str = (
+        "https://api.groq.com/openai/v1"
+    )
+
+
+    # Maximum time allowed for one provider request.
+    llm_timeout_seconds: float = 30.0
+        # Number of automatic retries for transient provider failures.
+    llm_max_retries: int = 2
+        # --- Week 5: AI cache + rate limiting ---
+
+    ai_rate_limit_requests: int = 20
+    ai_rate_limit_window_seconds: int = 60
+
+    ai_answer_cache_ttl_seconds: int = 60
+
+
 # Instantiated once at import time and reused everywhere (a singleton).
 # Creating Settings() is cheap but re-parsing env vars on every request
 # would be wasteful and could theoretically see a value change mid-request.

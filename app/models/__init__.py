@@ -40,3 +40,9 @@ from app.models.outbox_event import OutboxEvent  # noqa: F401
 
 from app.models.processed_event import ProcessedEvent  # noqa: F401
 
+from app.models.ai_interaction import AIInteraction  # noqa: F401
+from app.models.generated_content import (
+    GeneratedContent,
+    GeneratedContentType,
+)
+
