@@ -1,350 +1,355 @@
-# Design — Week 1
+# SmartRetail System Design - Weeks 1 to 5
 
-## Entity-Relationship Diagram
 
-```mermaid
-erDiagram
-    USER ||--o{ PRODUCT : "owns through merchant_id"
-    CATEGORY ||--o{ PRODUCT : "categorizes"
-    PRODUCT ||--o{ PRODUCT_VARIANT : "has"
-    PRODUCT ||--o{ PRODUCT_MEDIA : "has"
 
-    USER {
-        uuid id PK
-        string email UK
-        string password_hash
-        string full_name
-        enum role "customer | merchant | admin"
-        bool is_active
-        datetime created_at
-        datetime updated_at
-    }
 
-    CATEGORY {
-        uuid id PK
-        string name UK
-        int order_index
-        datetime created_at
-        datetime updated_at
-    }
 
-    PRODUCT {
-        uuid id PK
-        uuid merchant_id FK
-        uuid category_id FK
-        string title
-        text description
-        enum status "draft | published | inactive"
-        datetime created_at
-        datetime updated_at
-    }
 
-    PRODUCT_VARIANT {
-        uuid id PK
-        uuid product_id FK
-        string sku UK
-        numeric price "Numeric(10,2), never float"
-        int stock
-        jsonb attributes "for example: color, size"
-        bool is_active
-        datetime created_at
-        datetime updated_at
-    }
+## 1. Design Goal
 
-    PRODUCT_MEDIA {
-        uuid id PK
-        uuid product_id FK
-        string url
-        string media_type "image | video"
-        string alt_text "nullable"
-        int order_index
-        bool is_primary
-        datetime created_at
-        datetime updated_at
-    }
-```
+SmartRetail is a backend-only commerce platform built in five layers of capability:
 
-## Entity Responsibilities
+1. authenticated product/catalog foundation
+2. durable publishing and order workflows with concurrency-safe inventory
+3. background jobs, event-driven analytics, and observability
+4. semantic indexing and retrieval
+5. a grounded streaming AI assistant and merchant content generation
 
-### User
+The design keeps transactional correctness in PostgreSQL, workflow durability in Temporal, background work in Celery, event distribution in Kafka, caching/rate limiting in Redis, and AI retrieval vectors in pgvector.
 
-The `USER` entity represents customers, merchants, and administrators.
+The AI layer is deliberately additive. It does not become the source of truth for products, stock, prices, orders, or payments.
 
-A user's role controls which operations they may perform:
+---
 
-* `customer` users can browse published products.
-* `merchant` users can create and manage products they own.
-* `admin` users may perform administrative operations across the platform.
-
-Passwords are never stored directly. Only a secure password hash is stored in `password_hash`.
-
-The `email` field is unique because it is used as the user's login identity.
-
-### Category
-
-The `CATEGORY` entity groups products for catalog browsing and filtering.
-
-Each product belongs to one category. Category names are unique so duplicate catalog categories are not created accidentally.
-
-`order_index` controls the order in which categories are displayed.
-
-Nested categories are not included in the Week 1 model. A self-referencing `parent_id` may be introduced later if hierarchical categories become a confirmed requirement.
-
-### Product
-
-The `PRODUCT` entity represents the general catalog item.
-
-Examples include:
-
-* Cotton T-shirt
-* Wireless headphones
-* Running shoes
-
-A product belongs to:
-
-* one merchant through `merchant_id`
-* one category through `category_id`
-
-The product does not store its own price or inventory quantity. Those values belong to its variants.
-
-The Week 1 product statuses are:
-
-* `draft` — still being prepared and not visible publicly
-* `published` — visible to customers
-* `inactive` — no longer available for normal catalog browsing
-
-Week 2 may add workflow-related states such as `publishing` and `publish_failed` through a new migration.
-
-### ProductVariant
-
-The `PRODUCT_VARIANT` entity represents a specific sellable version of a product.
-
-For example, the product:
+## 2. High-Level Architecture
 
 ```text
-Cotton T-shirt
+                         +----------------------+
+                         | Swagger / curl client |
+                         +----------+-----------+
+                                    |
+                                    v
+                           +--------+--------+
+                           | FastAPI API      |
+                           | auth / products  |
+                           | orders / search  |
+                           | assistant / AI   |
+                           +---+---+---+---+--+
+                               |   |   |   |
+             +-----------------+   |   |   +--------------------+
+             |                     |   |                        |
+             v                     v   v                        v
+      +------+-------+      +------+---+------+          +------+-------+
+      | PostgreSQL   |      | Redis           |          | Prometheus   |
+      | + pgvector   |      | cache/idempot.  |          | /metrics     |
+      | source truth |      | rate limit      |          +------+-------+
+      +---+-------+--+      +-----------------+                 |
+          |       |                                                   v
+          |       |                                            +------+--+
+          |       |                                            | Grafana |
+          |       |                                            +---------+
+          |       |
+          |       +-------------------+
+          |                           |
+          v                           v
+ +--------+---------+        +--------+---------+
+ | Temporal          |        | Outbox publisher |
+ | workflows/worker  |        | -> Kafka         |
+ +---+------------+--+        +--------+---------+
+     |            |                    |
+     |            |                    v
+     |            |             +------+-------+
+     |            |             | Kafka        |
+     |            |             +------+-------+
+     |            |                    |
+     |            v                    v
+     |      +-----+------+      +------+-------+
+     |      | Celery     |      | Consumer     |
+     |      | worker     |      | analytics    |
+     |      +------------+      +--------------+
+     |
+     +--> product publish -> chunk -> embed -> pgvector
+     +--> order saga -> reserve -> pay -> ship -> notify -> confirm
+
+AI path:
+FastAPI -> retrieval service -> pgvector/live catalog -> versioned prompt
+        -> async LLMProvider -> SSE -> ai_interactions/generated_content
 ```
 
-may have variants such as:
+---
 
-```text
-Red / Medium
-Red / Large
-Blue / Medium
-```
+## 3. Layered Application Structure
 
-Inventory and price belong to the variant because each sellable variation may have a different price and stock quantity.
+### `app/api/v1/`
 
-Important rules:
+FastAPI routers are HTTP translation layers. They parse requests, resolve dependencies, call services, and return/stream responses. They should not own SQL or core business rules.
 
-* `sku` must be unique.
-* `price` must be greater than zero.
-* `stock` must be zero or greater.
-* inactive variants are not available for purchase.
+Important router areas now include:
 
-The `attributes` JSONB field stores flexible characteristics such as:
-
-```json
-{
-  "color": "red",
-  "size": "M"
-}
-```
-
-This avoids adding a new database column for every possible product-specific property.
-
-### ProductMedia
-
-The `PRODUCT_MEDIA` entity stores images or videos attached to a product.
-
-It includes:
-
-* the media URL
-* the media type
-* accessibility alternative text
-* the display order
-* whether the media item is the primary product image
-
-A product can have multiple media records.
-
-## Inventory Placement
-
-Inventory lives on `PRODUCT_VARIANT`, never on `PRODUCT`.
-
-A general product such as a T-shirt is not directly purchasable. The customer purchases a specific variant such as:
-
-```text
-Red / Medium
-```
-
-Each variant has its own stock quantity.
-
-This design is also required for Week 2's concurrency-safe inventory update. The reservation logic will operate on one variant using an atomic statement similar to:
-
-```sql
-UPDATE product_variants
-SET stock = stock - :quantity
-WHERE id = :variant_id
-  AND stock >= :quantity;
-```
-
-The `stock >= :quantity` condition prevents the stock value from becoming negative when multiple orders attempt to reserve the final units concurrently.
-
-## Relationships
-
-The Week 1 relationships are:
-
-* One merchant user can own many products.
-* Each product belongs to one merchant.
-* One category can contain many products.
-* Each product belongs to one category.
-* One product can have many variants.
-* Each variant belongs to one product.
-* One product can have many media records.
-* Each media record belongs to one product.
-
-## Deletion Behavior
-
-Deleting a product should also delete its related:
-
-* product variants
-* product media records
-
-This is a cascade-delete relationship because variants and media cannot exist meaningfully without their parent product.
-
-Users should generally be deactivated using `is_active = false` instead of being physically deleted. This avoids accidentally removing merchant ownership records and preserves audit history.
-
-Categories should not be deleted while products still reference them unless those products are moved to another category first.
-
-## Timestamps
-
-Every table includes:
-
-* `created_at`
-* `updated_at`
-
-Both values must use timezone-aware UTC timestamps.
-
-Naive local datetimes should not be stored because the backend may later run across different servers, regions, or time zones.
-
-## Public Product Visibility
-
-Anonymous users and customers should only see products that satisfy all of the following:
-
-* the product status is `published`
-* at least one variant is active
-* at least one active variant has stock greater than zero
-
-Merchants may view their own products even when they are:
-
-* drafts
-* inactive
-* out of stock
-
-Administrators may view all products.
-
-The visibility logic belongs in the service layer rather than directly inside router functions.
-
-## Ownership and Role Checks
-
-Role authorization and resource ownership are separate checks.
-
-A role check answers:
-
-> Is this user allowed to use merchant functionality?
-
-An ownership check answers:
-
-> Does this merchant own this specific product?
-
-For example:
-
-* A customer calling a merchant-only endpoint receives `403 Forbidden`.
-* A merchant editing another merchant's product also receives `403 Forbidden`.
-* An administrator may be allowed to edit products regardless of ownership, depending on the endpoint.
-
-Combining role and ownership into one check could accidentally allow one merchant to edit a competitor's products.
-
-## Module Breakdown
-
-### `app/core/`
-
-Contains application-wide concerns that are not specific to products, users, or orders.
-
-Examples include:
-
-* environment settings
-* JWT and password-hashing helpers
-* authentication dependencies
-* authorization dependencies
-* application exceptions
-* logging
-* metrics
-
-Database connection code does not belong here.
-
-### `app/db/`
-
-Contains SQLAlchemy database infrastructure.
-
-Current files include:
-
-* `base.py` — defines the declarative `Base` inherited by ORM models
-* `session.py` — defines the engine, session factory, and `get_db`
-
-The database layer knows how to connect to PostgreSQL, but it does not contain product or authentication business rules.
-
-### `app/models/`
-
-Contains SQLAlchemy ORM model classes.
-
-Each model describes database table shape, including:
-
-* columns
-* constraints
-* foreign keys
-* ORM relationships
-
-Models should not contain HTTP handling or complex business rules.
-
-### `app/schemas/`
-
-Contains Pydantic request and response models.
-
-Schemas should be separated by purpose, such as:
-
-* `ProductCreate`
-* `ProductUpdate`
-* `ProductOut`
-* `UserRegister`
-* `UserLogin`
-* `UserOut`
-
-Response schemas structurally prevent internal fields such as `password_hash` from being returned to clients.
+- authentication
+- categories
+- products and publishing
+- inventory
+- orders
+- analytics
+- search
+- assistant
+- merchant AI generation
+- health/readiness
 
 ### `app/services/`
 
-Contains the application's business logic.
+Services contain business rules and database operations, including:
 
-Service functions:
+- product ownership and lifecycle rules
+- inventory reservation
+- order creation
+- semantic search
+- grounded assistant orchestration
+- AI interaction persistence
+- merchant generation
+- AI analytics
 
-* receive a SQLAlchemy `Session`
-* receive schemas or plain Python arguments
-* apply business rules
-* query or update database models
-* return models or raise application exceptions
+### `app/models/`
 
-Services should not use FastAPI's `Depends` or import HTTP request objects.
+SQLAlchemy models define durable data shape only.
 
-Keeping the service layer independent from FastAPI allows business behavior to be unit-tested without starting the HTTP layer.
+### `app/schemas/`
 
+Pydantic schemas validate request/response and structured AI outputs.
 
-## Inventory concurrency
+### `app/core/`
 
-Inventory is stored at the product-variant level.
+Cross-cutting concerns include:
 
-To prevent overselling, inventory reservation uses a single atomic
-conditional PostgreSQL UPDATE:
+- environment settings
+- auth/security dependencies
+- application exceptions
+- Redis helpers
+- idempotency
+- correlation IDs
+- logging
+- Prometheus metrics
+- AI rate limiting and answer caching
+
+### `app/temporal/`
+
+Contains durable product publishing and order saga workflows plus Activities.
+
+### `app/events/`
+
+Contains the transactional outbox, Kafka producer/publisher, consumer, event envelope, and event handlers.
+
+### `app/workers/`
+
+Contains Celery configuration and background jobs such as notifications.
+
+### `app/ai/`
+
+Contains provider abstractions and prompt definitions:
+
+- embeddings provider + FakeEmbeddings
+- LLM provider + FakeLLM
+- centralized versioned prompt builders
+
+---
+
+## 4. Core Data Model
+
+```text
+USER
+  | owns
+  v
+PRODUCT ---------> CATEGORY
+  |
+  +----> PRODUCT_VARIANT      (price, stock, SKU, attributes)
+  +----> PRODUCT_MEDIA
+  +----> CONTENT_CHUNK        (semantic text, embedding, retrieval metadata)
+  +----> GENERATED_CONTENT    (description/SEO/FAQ, model, prompt version)
+
+USER(customer)
+  |
+  +----> ORDER
+           |
+           +----> ORDER_ITEM ------> PRODUCT_VARIANT
+           +----> INVENTORY_RESERVATION
+           +----> PAYMENT
+           +----> SHIPMENT
+           +----> ORDER_STATUS_HISTORY
+
+AI_INTERACTION
+  +---- user_id (when authenticated)
+  +---- question / intent / answer / refused / status
+  +---- product_ids / variant_ids
+  +---- model / prompt_version / tokens / latency / correlation_id
+
+Operational/event records:
+OUTBOX_EVENT -> Kafka -> PROCESSED_EVENT / analytics aggregates
+FAILED_JOB
+NOTIFICATION
+```
+
+---
+
+## 5. User Roles and Authorization
+
+SmartRetail has three roles:
+
+```text
+customer
+merchant
+admin
+```
+
+Authentication and authorization are separate concerns.
+
+```text
+request
+  -> JWT authentication
+  -> active user lookup
+  -> role check
+  -> ownership check when resource-scoped
+```
+
+Examples:
+
+- missing token on a protected endpoint -> `401`
+- customer calling merchant generation -> `403`
+- merchant generating content for another merchant's product -> `403`
+- admin may perform privileged operations according to endpoint policy
+
+Passwords are stored only as secure hashes. JWTs carry subject, role, and expiry, but the backend also reloads the user so deactivated/deleted users are not trusted solely because they still possess a token.
+
+---
+
+## 6. Product and Variant Design
+
+A `Product` is the catalog concept. A `ProductVariant` is the sellable unit.
+
+```text
+Product: Phone
+  +-- Variant A: 128GB / Black / SKU-A / price / stock
+  +-- Variant B: 256GB / Silver / SKU-B / price / stock
+```
+
+Price and inventory live on `ProductVariant`, never on the general product.
+
+Important constraints:
+
+- SKU is unique
+- price uses fixed-precision numeric storage
+- stock cannot be negative
+- variant attributes use JSONB
+- inactive variants cannot be purchased
+
+---
+
+## 7. Product Lifecycle
+
+The lifecycle now includes workflow states:
+
+```text
+draft
+  -> publishing
+       -> published
+       -> publish_failed
+
+published -> inactive
+publish_failed -> publishing (retry)
+```
+
+The API guards illegal entry actions while the Temporal workflow drives internal progression.
+
+A product is not marked published until all required publishing Activities, including Part B embedding, succeed.
+
+---
+
+## 8. Product Publishing Workflow
+
+The current product publishing architecture is a Temporal workflow.
+
+```text
+POST /products/{id}/publish
+        |
+        v
+status = PUBLISHING
+        |
+        v
+Temporal ProductPublishWorkflow
+        |
+        +--> validate_product_activity
+        +--> process_media_activity
+        +--> build_catalog_activity
+        +--> chunk/update content chunk
+        +--> embedding Activity (batched, retryable)
+        +--> store vector + metadata
+        +--> mark_product_published_activity
+        |
+        +--> on permanent failure -> mark PUBLISH_FAILED
+```
+
+Workflow status queries expose the current step, including embedding progress.
+
+### Why Temporal
+
+Temporal records workflow history and retries Activities. If the worker crashes, the workflow resumes from durable history rather than restarting ad hoc logic inside an HTTP request.
+
+### Activity idempotency
+
+Activities must tolerate retries. Examples:
+
+- media processing sets a final state again safely
+- chunk/index code replaces/updates current derived records instead of blindly appending duplicates
+- publish finalization does not unpublish an already published product
+
+---
+
+## 9. Content Chunks, Embeddings, and Re-Indexing
+
+One enriched semantic chunk is currently created per product. It contains title/category/description/specification signal sufficient for semantic retrieval.
+
+pgvector stores the embedding alongside metadata used for correctness filtering.
+
+Re-publishing handles two cases:
+
+```text
+semantic text changed -> re-embed
+semantic text unchanged -> keep vector, refresh metadata
+```
+
+A SHA-256 text hash supports this optimization and avoids unnecessary provider cost.
+
+No stale duplicated vectors should remain after re-publish.
+
+---
+
+## 10. Semantic Search
+
+```text
+POST /search
+```
+
+Customer search:
+
+```text
+query
+ -> embedding provider
+ -> pgvector cosine distance
+ -> published/available/in-stock filters
+ -> live active variant stock check
+ -> minimum similarity threshold
+ -> top-k results (default 5)
+```
+
+The live catalog remains authoritative. Vector similarity is never allowed to make an unavailable product buyable.
+
+Current development similarity threshold is 0.20.
+
+---
+
+## 11. Inventory Concurrency
+
+Overselling is prevented at the database layer with an atomic conditional update:
 
 ```sql
 UPDATE product_variants
@@ -352,213 +357,509 @@ SET stock = stock - :qty
 WHERE id = :variant_id
   AND stock >= :qty
 RETURNING id;
+```
 
-### `app/api/v1/`
+If no row is returned, the reservation fails because sufficient stock was not available at the instant of the update.
 
-Contains version 1 FastAPI routers.
-
-Routers are thin translation layers that:
-
-* receive HTTP requests
-* let FastAPI and Pydantic validate input
-* receive dependencies such as the database session and current user
-* call service functions
-* return responses using declared response models
-
-A router should not contain SQL queries or substantial business logic.
-
-If a router function becomes long or starts checking ownership, stock, publishing rules, or database constraints directly, that logic should be moved into a service.
-
-## Key Decisions and Tradeoffs
-
-### UUID Primary Keys
-
-UUIDs are used instead of auto-incrementing integers.
-
-Benefits:
-
-* identifiers are difficult to guess
-* IDs do not expose the approximate number of records
-* IDs can be generated independently across distributed services
-
-Tradeoffs:
-
-* UUID indexes are larger than integer indexes
-* UUID values are less readable during manual debugging
-* UUIDs do not provide a natural insertion order
-
-When chronological order matters, records should be explicitly sorted by `created_at`.
-
-### Numeric Prices Instead of Floating-Point Prices
-
-Variant prices use:
+This avoids the classic race condition:
 
 ```text
-Numeric(10,2)
+SELECT stock
+check in Python
+UPDATE later
 ```
 
-rather than floating-point values.
+Two concurrent requests cannot both "win" the final unit because PostgreSQL evaluates the condition atomically during the update.
 
-Floating-point numbers may produce precision errors when representing decimal money values.
+Inventory reservations are durable records so retries do not decrement the same reservation twice.
 
-Database numeric types and Python `Decimal` values provide predictable price calculations.
+---
 
-### JSONB Variant Attributes
+## 12. Order Idempotency
 
-Variant-specific characteristics are stored in a JSONB column.
+Clients send an `Idempotency-Key` when creating an order.
 
-A T-shirt might use:
+Redis stores the key/result mapping with a TTL so retrying the same customer request returns the original order rather than creating another order/payment.
 
-```json
-{
-  "color": "blue",
-  "size": "L"
-}
+This solves a different problem from the atomic stock update:
+
+- atomic update prevents concurrent oversell
+- idempotency key prevents duplicate logical requests
+
+Both are required.
+
+---
+
+## 13. Order Saga
+
+Order processing runs as a Temporal saga rather than inside the HTTP request.
+
+Forward path:
+
+```text
+reserve inventory
+ -> authorize payment
+ -> create shipment
+ -> queue notification
+ -> confirm order
 ```
 
-A book might use:
+Compensation examples:
 
-```json
-{
-  "format": "hardcover",
-  "edition": "second"
-}
+```text
+payment fails after reservation
+ -> release inventory
+ -> cancel/reject order
+
+post-payment step fails
+ -> cancel order
+ -> refund payment
+ -> release inventory
+ -> final refunded state
 ```
+
+The saga preserves an auditable order history rather than deleting failed/cancelled orders.
+
+---
+
+## 14. Notifications and Celery
+
+Temporal does not directly perform the final notification I/O. The notification Activity enqueues a Celery task:
+
+```text
+Temporal Activity
+    -> send_order_notification.delay(...)
+    -> Redis/Celery broker
+    -> Celery worker
+    -> notifications task/service
+    -> notifications table
+```
+
+This separates durable business workflow orchestration from retryable background notification delivery.
+
+---
+
+## 15. Transactional Outbox and Kafka
+
+Business events use a transactional outbox.
+
+```text
+business database change
+   + outbox enqueue in same DB transaction
+        |
+        v
+outbox_events
+        |
+        | periodic publisher
+        v
+Kafka producer
+        |
+        v
+smartretail.events
+        |
+        v
+consumer
+        |
+        +--> idempotency check (processed_events)
+        +--> analytics/event handlers
+        +--> commit Kafka offset only after successful processing
+```
+
+The outbox avoids the dual-write problem where a database commit succeeds but the corresponding Kafka publish is lost.
+
+The consumer assumes at-least-once delivery, not exactly-once delivery. `processed_events.event_id` makes duplicate deliveries safe.
+
+---
+
+## 16. Analytics and Reconciliation
+
+Part A commerce analytics are maintained through event-driven aggregates and exposed through analytics endpoints.
+
+A reconciliation endpoint compares aggregate values with raw transactional tables to detect drift.
+
+Week 5 adds `GET /analytics/ai`, including:
+
+- answered/refused counts
+- intent breakdown
+- average/p95 latency
+- total tokens
+- conversion-after-AI
+
+AI interactions retain user/retrieved-variant information so a later order can be checked against products recommended before that purchase.
+
+---
+
+## 17. Observability
+
+### Structured logging
+
+Application logs are JSON structured and carry a correlation ID where possible.
+
+The correlation ID is propagated across:
+
+- HTTP request handling
+- Temporal Activities
+- event envelopes
+- consumer processing
+- persisted AI interaction records
+
+This allows a single request/order/AI interaction to be followed across asynchronous components.
+
+### Prometheus
+
+`/metrics` exposes HTTP and domain metrics, including:
+
+```text
+http_requests_total
+http_request_duration_seconds
+orders_placed_total
+inventory_oversell_prevented_total
+events_consumed_total
+events_failed_total
+ai_requests_total
+ai_failures_total
+ai_request_latency_seconds
+ai_tokens_total
+```
+
+Prometheus scrapes these metrics and Grafana visualizes them.
+
+### Readiness
+
+`/health/ready` checks dependencies such as PostgreSQL, Redis, Kafka, and Temporal so "process is running" is not confused with "service is ready".
+
+---
+
+## 18. AI Assistant Architecture
+
+The customer assistant is retrieval-augmented generation (RAG).
+
+```text
+POST /assistant/ask
+  |
+  +--> authenticate customer
+  +--> per-user Redis rate limit
+  +--> identical-question Redis cache lookup
+  +--> validate question / injection guard
+  +--> deterministic intent routing
+       |
+       +--> discovery -> semantic retrieval
+       +--> guidance  -> semantic retrieval
+       +--> comparison -> resolve the two named buyable products
+  +--> refuse if required grounded data is unavailable
+  +--> build centralized/versioned prompt
+  +--> async LLMProvider.stream()
+  +--> SSE text chunks
+  +--> application-generated citations
+  +--> terminal done
+  +--> persist AIInteraction
+  +--> metrics / analytics
+  +--> cache successful completed answer
+```
+
+The LLM is never the authority for whether a product exists or is buyable.
+
+---
+
+## 19. Grounded Comparison Design
+
+Comparison is stricter than generic semantic retrieval.
+
+The request names two products. Each target is resolved independently against real buyable catalog records. If either named product is missing or unavailable, SmartRetail refuses the comparison.
+
+This prevents a nearest-neighbor search from silently replacing a missing product with something that happens to be semantically similar.
+
+---
+
+## 20. Prompt Safety
+
+Prompts are centralized and versioned in `app/ai/prompts.py`.
+
+The design uses:
+
+- explicit system grounding rules
+- clearly delimited catalog context
+- clearly delimited customer question
+- retrieved text treated as untrusted data
+- deterministic application-level prompt-injection pattern checks
+- application-generated citations rather than trusting model-created identifiers
+
+This is a basic prompt-injection defense, not a claim of perfect prompt security.
+
+---
+
+## 21. SSE Streaming and Non-Blocking I/O
+
+AI endpoints return `text/event-stream` responses.
+
+Assistant sequence:
+
+```text
+text* -> citations -> done
+```
+
+Merchant generation sequence varies by content type but always ends with metadata/validated content followed by a terminal done event.
+
+The real LLM provider uses an asynchronous SDK client so waiting for AI output does not intentionally block the FastAPI event loop.
+
+Client disconnects are handled by persisting partial assistant output as `truncated`.
+
+The provider currently has timeout and retry configuration. Final 5.14 hardening still needs complete clean-SSE error framing for every provider failure after a stream has started.
+
+---
+
+## 22. Merchant AI Generation
+
+Merchant generation is protected by both role and ownership checks.
+
+```text
+POST /products/{id}/generate/description
+POST /products/{id}/generate/seo
+POST /products/{id}/generate/faq
+```
+
+Description streams text.
+
+SEO and FAQ are structured outputs. The server collects model JSON internally, validates it, and only exposes validated structures.
+
+FAQ allows one repair attempt after malformed output. It does not loop indefinitely.
+
+Successful generated content is stored with product, type, model, prompt version, and accepted flag.
+
+---
+
+## 23. AI Interaction Data Model
+
+`AIInteraction` supports auditing and analytics.
+
+```text
+id
+user_id (nullable where appropriate)
+correlation_id
+question
+intent
+answer
+refused
+status
+prompt_version
+model
+product_ids (JSONB)
+variant_ids (JSONB)
+input_tokens
+output_tokens
+latency_ms
+created_at / updated_at
+```
+
+Statuses distinguish completed, refused, failed, and truncated behavior.
+
+---
+
+## 24. Generated Content Data Model
+
+`GeneratedContent` stores merchant AI output:
+
+```text
+id
+product_id
+type: description | seo | faq
+content JSONB
+model
+prompt_version
+accepted
+created_at / updated_at
+```
+
+This makes generated content reviewable and reproducible instead of treating it as ephemeral model text.
+
+---
+
+## 25. Redis Caching and Rate Limiting
+
+### Product list cache
+
+Public product listing uses Redis with an explicit TTL and version-based invalidation.
+
+### Assistant answer cache
+
+Completed identical assistant questions are cached by a deterministic normalized-question key plus catalog version. Cache hits still create an AI interaction record but use zero new LLM tokens.
+
+Current documented TTL is 60 seconds.
+
+### AI rate limit
+
+A fixed-window Redis counter limits AI requests per authenticated user.
+
+Normal development configuration:
+
+```text
+20 requests / 60 seconds / user
+```
+
+A test with a temporary limit of 3 verified that the fourth request returns `429 rate_limit_exceeded`.
+
+---
+
+## 26. Error Model
+
+Service logic raises application exceptions rather than embedding FastAPI-specific `HTTPException` behavior throughout the domain layer.
+
+Examples now include:
+
+- `NotFoundError`
+- `UnauthorizedError`
+- `ForbiddenError`
+- `ConflictError`
+- `ValidationFailedError`
+- `AIOutputValidationError`
+- `TooManyRequestsError`
+- `AIProviderUnavailableError`
+
+A centralized handler converts application errors into a consistent JSON response shape.
+
+---
+
+## 27. Key Design Decisions and Tradeoffs
+
+### PostgreSQL + pgvector rather than a separate vector service
 
 Benefits:
 
-* supports different product types
-* avoids frequent schema migrations
-* allows flexible merchant-defined attributes
-
-Tradeoffs:
-
-* attribute types are not strongly constrained by fixed database columns
-* filtering arbitrary attributes may require more complex queries and indexes
-* validation must primarily happen through Pydantic and service logic
-
-### Domain Exceptions
-
-Service functions raise application-specific exceptions rather than FastAPI `HTTPException`.
-
-Examples include:
-
-* `NotFoundError`
-* `ForbiddenError`
-* `ConflictError`
-* `ValidationFailedError`
-* `UnauthorizedError`
-
-These exceptions inherit from a common `AppError` base class.
-
-A centralized exception handler in `main.py` converts them into one consistent JSON structure:
-
-```json
-{
-  "error_code": "product_not_found",
-  "message": "Product was not found"
-}
-```
-
-Benefits:
-
-* error responses remain consistent
-* services remain independent from FastAPI
-* routers do not need repeated `try` and `except` blocks
+- one source database and one operational stack
+- easy joins/filtering with current product/variant state
+- straightforward correctness filtering
 
 Tradeoff:
 
-* developers must trace errors through the exception handler while debugging
+- very large-scale ANN tuning may eventually favor a dedicated vector engine
 
-The exception hierarchy should therefore remain small and clearly documented.
+### One enriched chunk per product
 
-### Synchronous Publishing in Week 1
+Benefits:
 
-In Week 1, publishing is implemented synchronously.
+- product name, specs, category, and description stay together
+- simple re-index semantics
+- appropriate for the current catalog size
 
-The router calls a product service that:
+Tradeoff:
 
-1. checks that the current user may edit the product
-2. validates the product
-3. collects all validation errors
-4. changes the product status to `published`
-5. commits the database transaction
+- very long future product content may need smaller semantically coherent chunks
 
-Validation includes:
+### Database/live stock as authority
 
-* title is required
-* description is required
-* at least one variant exists
-* every variant has a price greater than zero
-* every variant has stock greater than or equal to zero
+Vector metadata is deliberately not trusted as the final availability truth. This adds a live relational check but prevents stale index state from recommending a sold-out product.
 
-This logic belongs in `product_service`, not in the router.
+### Deterministic intent routing
 
-The endpoint contract remains:
+Simple keyword/rule routing avoids paying for an additional LLM classification call and keeps tests deterministic.
+
+Tradeoff:
+
+- nuanced natural-language intent classification is less flexible than a model router
+
+### Refusal before LLM call
+
+When required catalog context does not exist, the service refuses without calling the LLM.
+
+Benefits:
+
+- lower cost
+- lower latency
+- smaller hallucination surface
+
+### Redis cache keyed by catalog version
+
+This avoids expensive key scans on every product change. Old cache keys expire naturally while new requests use the new catalog version.
+
+### Async LLM client
+
+An async provider avoids intentionally blocking the event loop during network waits.
+
+---
+
+## 28. Security and Secret Handling
+
+- `.env` must remain ignored by Git
+- API keys are environment variables only
+- tests default to fake providers and require no secret
+- JWT-protected endpoints resolve an active database user
+- merchant AI generation requires merchant/admin role plus product ownership
+- assistant access is authenticated so per-user rate limiting and conversion analytics can identify the customer
+
+---
+
+## 29. Testing Strategy
+
+The current suite reports:
 
 ```text
-POST /products/{product_id}/publish
+116 passed
 ```
 
-This allows Week 2 to replace the internal implementation with a Temporal workflow without unnecessarily changing how clients call the endpoint.
+Testing spans:
 
-### Pagination Limit
+- auth and role enforcement
+- product ownership
+- inventory concurrency and oversell prevention
+- order idempotency and compensation
+- search filtering/threshold/re-index behavior
+- FakeEmbeddings and FakeLLM
+- assistant grounding/refusal/comparison
+- malformed input
+- FAQ structured validation and repair
+- SSE shape and disconnect handling
+- merchant AI access control
+- AI persistence/analytics behavior
 
-Product listing uses:
+The full suite is designed to run without real AI-provider network calls.
+
+---
+
+## 30. Current Completion State
+
+Completed through Week 5 task 5.13:
 
 ```text
-limit
-offset
+5.1  LLMProvider + FakeLLM
+5.2  versioned prompts
+5.3  discovery assistant
+5.4  strict grounded comparison/refusal
+5.5  buying guidance
+5.6  input validation/injection awareness
+5.7  ai_interactions persistence
+5.8  SSE assistant streaming/disconnect persistence
+5.9  merchant description/SEO/FAQ + validation/repair
+5.10 generated_content persistence
+5.11 AI analytics + Prometheus metrics
+5.12 Redis answer cache + per-user rate limit
+5.13 deterministic/access-control/streaming tests
 ```
 
-The default limit is 20 and the maximum allowed limit is 100.
+Partially complete 5.14:
 
-Without a server-side maximum, a client could request a very large limit and force the backend to query and serialize the entire product table in one request.
+- async provider implemented
+- provider timeout configured
+- provider retry count configured
+- provider errors translated to application error
+- remaining: clean terminal SSE error behavior in every provider-failure path, README/.env.example updates, and clean-clone one-command verification
 
-Paginated responses include:
+Final documentation/demonstration tasks remain to be finished after that hardening pass.
 
-```json
-{
-  "items": [],
-  "total": 0,
-  "limit": 20,
-  "offset": 0
-}
-```
+---
 
-Returning `total` allows clients to calculate how many pages exist.
+## 31. Assignment Alignment
 
-## What Week 2 Changes
+The updated architecture is aligned with the Part B emphasis on groundedness and correctness:
 
-Week 2 introduces durable workflows and concurrency-safe order processing.
+- only real, buyable catalog products may be recommended
+- impossible/missing-product requests are refused
+- comparison uses two real named products
+- vectors are derived data, not catalog authority
+- all AI work is observable and auditable
+- structured outputs are validated
+- long output streams progressively
+- Redis reduces repeated AI work and enforces per-user limits
+- fake providers keep tests deterministic and network-free
 
-Expected data-model and behavior changes include:
+The project intentionally prioritizes a cautious grounded answer over a fluent invented answer.
 
-* adding workflow-related product statuses such as `publishing` and `publish_failed`
-* changing the publish operation from a synchronous status update to a Temporal workflow
-* returning `202 Accepted` when the publish workflow starts
-* returning a workflow identifier
-* adding a publish-status endpoint
-* preventing illegal status transitions
-* adding inventory reservation records
-* adding order, payment, and shipment entities
-* implementing atomic stock reservation against `ProductVariant`
-* implementing compensation actions when later workflow steps fail
-
-A future `content_chunks` table may be introduced when the publishing workflow prepares product text for the retrieval and AI layers.
-
-## Week 1 Design Summary
-
-The Week 1 model follows these core rules:
-
-* inventory belongs to product variants
-* merchants own products
-* role and ownership checks are separate
-* prices use fixed-precision numeric storage
-* every table uses timezone-aware UTC timestamps
-* routers stay thin
-* services contain business logic
-* models describe database structure
-* schemas control request and response data
-* Alembic manages schema creation and changes
-* ORM objects are never returned without response-schema filtering

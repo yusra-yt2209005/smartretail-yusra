@@ -22,9 +22,9 @@ SAMPLE_PRODUCTS = [
 
 
 def test_prompt_versions_are_defined():
-    assert DISCOVERY_PROMPT_VERSION == "discovery-v1"
-    assert COMPARISON_PROMPT_VERSION == "comparison-v1"
-    assert GUIDANCE_PROMPT_VERSION == "guidance-v1"
+    assert DISCOVERY_PROMPT_VERSION == "discovery-v2"
+    assert COMPARISON_PROMPT_VERSION == "comparison-v2"
+    assert GUIDANCE_PROMPT_VERSION == "guidance-v2"
 
 
 def test_format_product_context_contains_product_data():

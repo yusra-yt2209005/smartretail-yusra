@@ -3,6 +3,7 @@ import uuid
 from sqlalchemy import (
     Boolean,
     Float,
+    ForeignKey,
     Integer,
     String,
     Text,
@@ -36,6 +37,18 @@ class AIInteraction(
         UUID(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
+    )
+
+    user_id: Mapped[
+        uuid.UUID | None
+    ] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "users.id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        index=True,
     )
 
     correlation_id: Mapped[str] = mapped_column(

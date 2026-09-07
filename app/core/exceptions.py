@@ -95,3 +95,56 @@ class ValidationFailedError(AppError):
     def __init__(self, errors: list[str]):
         self.errors = errors
         super().__init__("; ".join(errors))
+
+class AIOutputValidationError(AppError):
+    """
+    The AI provider responded, but its structured output could
+    not be validated even after the allowed repair attempt.
+    """
+
+    status_code = 502
+    error_code = "ai_output_invalid"
+
+    def __init__(
+        self,
+        message: str = (
+            "The AI provider returned invalid structured output."
+        ),
+    ):
+        super().__init__(message)
+
+class TooManyRequestsError(AppError):
+    """
+    The user exceeded the allowed AI request rate.
+    """
+
+    status_code = 429
+    error_code = "rate_limit_exceeded"
+
+    def __init__(
+        self,
+        message: str = (
+            "Too many AI requests. "
+            "Please try again shortly."
+        ),
+    ):
+        super().__init__(
+            message
+        )
+
+class AIProviderUnavailableError(AppError):
+    """
+    The external LLM provider timed out or became unavailable.
+    """
+
+    status_code = 503
+    error_code = "ai_provider_unavailable"
+
+    def __init__(
+        self,
+        message: str = (
+            "The AI service is temporarily unavailable. "
+            "Please try again shortly."
+        ),
+    ):
+        super().__init__(message)

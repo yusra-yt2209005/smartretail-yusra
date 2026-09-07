@@ -5,6 +5,9 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from app.core.config import settings
+from app.core.exceptions import (
+    AIProviderUnavailableError,
+)
 
 #  The use of AsyncOpenAI and await client.responses.create(...), including stream=True with 
 #  asynchronous iteration, matches the current SDK's Responses API pattern.
@@ -137,15 +140,19 @@ class OpenAILLMProvider(LLMProvider):
                 "when LLM_PROVIDER=openai"
             )
 
+      
         self._client = AsyncOpenAI(
             api_key=resolved_api_key,
             timeout=(
                 timeout_seconds
                 or settings.llm_timeout_seconds
             ),
+            max_retries=(
+                settings.llm_max_retries
+            ),
         )
 
-    async def generate( #his is where the actual real non-streaming provider call happens.
+    async def generate(
         self,
         *,
         system_prompt: str,
@@ -153,14 +160,23 @@ class OpenAILLMProvider(LLMProvider):
     ) -> LLMResult:
         """
         Make one complete OpenAI Responses API request.
+
+        Provider/network failures are translated into a stable
+        application-level 503 error.
         """
 
-        response = await self._client.responses.create(
-            model=self.model_name,
-            instructions=system_prompt,
-            input=user_prompt,
-            store=False,
-        )
+        try:
+            response = (
+                await self._client.responses.create(
+                    model=self.model_name,
+                    instructions=system_prompt,
+                    input=user_prompt,
+                    store=False,
+                )
+            )
+
+        except Exception as exc:
+            raise AIProviderUnavailableError() from exc
 
         usage = response.usage
 
@@ -186,52 +202,203 @@ class OpenAILLMProvider(LLMProvider):
         user_prompt: str,
     ) -> AsyncIterator[LLMStreamEvent]:
         """
-        Make a streaming OpenAI Responses API request.
+        Stream an OpenAI response asynchronously.
 
-        Text deltas are yielded as soon as they arrive.
-
-        A final done event contains usage information.
+        Provider/network failures are converted into a stable
+        application-level error instead of leaking SDK exceptions.
         """
 
-        stream = await self._client.responses.create(
-            model=self.model_name,
-            instructions=system_prompt,
-            input=user_prompt,
-            store=False,
-            stream=True,
+        try:
+            stream = (
+                await self._client.responses.create(
+                    model=self.model_name,
+                    instructions=system_prompt,
+                    input=user_prompt,
+                    store=False,
+                    stream=True,
+                )
+            )
+
+            async for event in stream:
+
+                if (
+                    event.type
+                    == "response.output_text.delta"
+                ):
+                    yield LLMStreamEvent(
+                        text=event.delta,
+                    )
+
+                elif (
+                    event.type
+                    == "response.completed"
+                ):
+                    usage = (
+                        event.response.usage
+                    )
+
+                    yield LLMStreamEvent(
+                        done=True,
+                        input_tokens=(
+                            usage.input_tokens
+                            if usage is not None
+                            else 0
+                        ),
+                        output_tokens=(
+                            usage.output_tokens
+                            if usage is not None
+                            else 0
+                        ),
+                    )
+
+        except Exception as exc:
+            raise AIProviderUnavailableError() from exc
+
+
+
+# ---------------------------------------------------------------------
+# Real Groq implementation
+# ---------------------------------------------------------------------
+
+
+class GroqLLMProvider(LLMProvider):
+    """
+    Real LLM provider using Groq's OpenAI-compatible Responses API.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str | None = None,
+        api_key: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> None:
+
+        from openai import AsyncOpenAI
+
+        self.model_name = (
+            model
+            or settings.llm_model
         )
 
-        async for event in stream:
+        resolved_api_key = (
+            api_key
+            or settings.groq_api_key
+        )
 
-            if (
-                event.type
-                == "response.output_text.delta"
-            ):
-                yield LLMStreamEvent(
-                    text=event.delta,
+        if not resolved_api_key.strip():
+            raise ValueError(
+                "GROQ_API_KEY must be configured "
+                "when LLM_PROVIDER=groq"
+            )
+
+        self._client = AsyncOpenAI(
+            api_key=resolved_api_key,
+            base_url=settings.groq_base_url,
+            timeout=(
+                timeout_seconds
+                or settings.llm_timeout_seconds
+            ),
+            max_retries=(
+                settings.llm_max_retries
+            ),
+        )
+
+    async def generate(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> LLMResult:
+        """
+        Generate one complete response using Groq.
+        """
+
+        try:
+            response = (
+                await self._client.responses.create(
+                    model=self.model_name,
+                    instructions=system_prompt,
+                    input=user_prompt,
                 )
+            )
 
-            elif (
-                event.type
-                == "response.completed"
-            ):
-                usage = event.response.usage
+        except Exception as exc:
+            raise AIProviderUnavailableError() from exc
 
-                yield LLMStreamEvent(
-                    done=True,
-                    input_tokens=(
-                        usage.input_tokens
-                        if usage is not None
-                        else 0
-                    ),
-                    output_tokens=(
-                        usage.output_tokens
-                        if usage is not None
-                        else 0
-                    ),
+        usage = response.usage
+
+        return LLMResult(
+            text=response.output_text,
+            model=self.model_name,
+            input_tokens=(
+                usage.input_tokens
+                if usage is not None
+                else 0
+            ),
+            output_tokens=(
+                usage.output_tokens
+                if usage is not None
+                else 0
+            ),
+        )
+
+    async def stream(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> AsyncIterator[LLMStreamEvent]:
+        """
+        Stream Groq output progressively.
+        """
+
+        try:
+            stream = (
+                await self._client.responses.create(
+                    model=self.model_name,
+                    instructions=system_prompt,
+                    input=user_prompt,
+                    stream=True,
                 )
+            )
+
+            async for event in stream:
+
+                if (
+                    event.type
+                    == "response.output_text.delta"
+                ):
+                    yield LLMStreamEvent(
+                        text=event.delta,
+                    )
+
+                elif (
+                    event.type
+                    == "response.completed"
+                ):
+                    usage = event.response.usage
+
+                    yield LLMStreamEvent(
+                        done=True,
+                        input_tokens=(
+                            usage.input_tokens
+                            if usage is not None
+                            else 0
+                        ),
+                        output_tokens=(
+                            usage.output_tokens
+                            if usage is not None
+                            else 0
+                        ),
+                    )
+
+        except Exception as exc:
+            raise AIProviderUnavailableError() from exc
 
 
+
+        
 # ---------------------------------------------------------------------
 # Fake provider
 # ---------------------------------------------------------------------
@@ -416,11 +583,6 @@ class FakeLLM(LLMProvider):
 def get_llm_provider() -> LLMProvider:
     """
     Return the LLM implementation configured for SmartRetail.
-
-    Configuration comes from app/core/config.py, which loads values
-    from the environment.
-
-    FakeLLM is the safe default for development and tests.
     """
 
     provider_name = (
@@ -434,6 +596,9 @@ def get_llm_provider() -> LLMProvider:
 
     if provider_name == "openai":
         return OpenAILLMProvider()
+
+    if provider_name == "groq":
+        return GroqLLMProvider()
 
     raise ValueError(
         "Unknown LLM provider: "

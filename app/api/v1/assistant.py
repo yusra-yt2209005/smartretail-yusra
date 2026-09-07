@@ -16,11 +16,16 @@ from app.db.session import get_db
 from app.schemas.assistant import (
     AssistantRequest,
 )
-from app.services.assistant_service import (
-    stream_assistant,
+from app.services.assistant_cache_service import (
+    stream_assistant_cached,
 )
-
-
+from app.core.dependencies import (
+    get_current_user,
+)
+from app.models.user import User
+from app.core.ai_rate_limit import (
+    enforce_ai_rate_limit,
+)
 router = APIRouter(
     prefix="/assistant",
     tags=["assistant"],
@@ -53,14 +58,20 @@ def _encode_sse(
 )
 async def ask_assistant(
     data: AssistantRequest,
-    db: Session = Depends(
-        get_db
+    db: Session = Depends(get_db),
+    user: User = Depends(
+        get_current_user
     ),
 ) -> StreamingResponse:
     """
     Stream a grounded SmartRetail shopping-assistant response
     using Server-Sent Events.
     """
+
+    # Per-user Redis AI rate limit.
+    enforce_ai_rate_limit(
+        user.id
+    )
 
     # Capture this while the normal request correlation context
     # is definitely still active.
@@ -69,11 +80,12 @@ async def ask_assistant(
     )
 
     async def event_generator():
-        async for event in stream_assistant(
+        async for event in stream_assistant_cached(
             db,
             question=data.question,
             top_k=data.top_k,
             correlation_id=correlation_id,
+            user_id=user.id,
         ):
             yield _encode_sse(
                 event

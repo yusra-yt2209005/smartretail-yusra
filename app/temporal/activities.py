@@ -1,6 +1,7 @@
 import hashlib
 import json
 import uuid
+import time
 from datetime import UTC, datetime
 from dataclasses import dataclass
 
@@ -258,6 +259,8 @@ def process_media_activity(
     Setting processed=True again has the same final result, so Temporal
     can safely retry this Activity.
     """
+    # DEMO ONLY: gives us time to kill the Temporal worker
+    time.sleep(20)
 
     product_id = uuid.UUID(input.product_id)
 

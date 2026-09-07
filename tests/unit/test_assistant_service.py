@@ -456,7 +456,7 @@ def test_guidance_calls_llm_when_products_found(
 
     assert (
         response.prompt_version
-        == "guidance-v1"
+        == "guidance-v2"
     )
 
 def test_guidance_does_not_call_llm_when_no_products(

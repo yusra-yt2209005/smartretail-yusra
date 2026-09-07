@@ -14,9 +14,13 @@ from app.models.user import User, UserRole
 from app.schemas.analytics import (
     AnalyticsReconciliationOut,
     AnalyticsSummaryOut,
+    AIAnalyticsOut,
 )
-from app.services import analytics_service
 
+from app.services import (
+    analytics_service,
+    ai_analytics_service
+)
 
 router = APIRouter(
     prefix="/analytics",
@@ -80,4 +84,23 @@ def reconcile_analytics(
     return analytics_service.reconcile_day(
         db,
         day,
+    )
+
+@router.get(
+    "/ai",
+    response_model=AIAnalyticsOut,
+)
+def get_ai_analytics(
+    db: Session = Depends(get_db),
+    _admin: User = Depends(
+        require_role(
+            UserRole.ADMIN
+        )
+    ),
+):
+    return (
+        ai_analytics_service
+        .get_ai_analytics(
+            db
+        )
     )

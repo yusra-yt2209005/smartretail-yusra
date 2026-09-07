@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import uuid
 from sqlalchemy.orm import Session
 
 from app.core.correlation import (
@@ -13,6 +13,7 @@ from app.models.ai_interaction import (
 def record_ai_interaction(
     db: Session,
     *,
+    user_id: uuid.UUID | None = None,
     question: str,
     intent: str,
     answer: str,
@@ -43,6 +44,7 @@ def record_ai_interaction(
 
     interaction = AIInteraction(
         correlation_id=resolved_correlation_id,
+        user_id=user_id,
         question=question,
         intent=intent,
         answer=answer,

@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import uuid
 import asyncio
 import re
 import time
@@ -35,8 +35,15 @@ from app.services.ai_interaction_service import (
     record_ai_interaction,
 )
 from app.core.logging import get_logger
-
-
+from app.core.metrics import (
+    AI_FAILURES_TOTAL,
+    AI_REQUEST_LATENCY_SECONDS,
+    AI_REQUESTS_TOTAL,
+    AI_TOKENS_TOTAL,
+)
+from app.core.exceptions import (
+    AIProviderUnavailableError,
+)
 logger = get_logger(
     "smartretail.ai.assistant"
 )
@@ -169,6 +176,7 @@ def _build_citations(
 def _persist_interaction(
     db: Session,
     *,
+    user_id: uuid.UUID | None = None,
     question: str,
     response: AssistantResponse,
     products: list[dict[str, Any]] | None,
@@ -214,6 +222,7 @@ def _persist_interaction(
 
     record_ai_interaction(
         db,
+        user_id=user_id,
         question=question,
         intent=response.intent.value,
         answer=response.answer,
@@ -230,6 +239,38 @@ def _persist_interaction(
         latency_ms=latency_ms,
         correlation_id=correlation_id,
     )
+    AI_REQUESTS_TOTAL.labels(
+        intent=response.intent.value,
+        refused=str(
+            response.refused
+        ).lower(),
+    ).inc()
+
+    AI_REQUEST_LATENCY_SECONDS.labels(
+        intent=response.intent.value,
+    ).observe(
+        latency_ms / 1000
+    )
+
+    AI_TOKENS_TOTAL.labels(
+        type="input",
+    ).inc(
+        input_tokens
+    )
+
+    AI_TOKENS_TOTAL.labels(
+        type="output",
+    ).inc(
+        output_tokens
+    )
+
+    if interaction_status in {
+        "failed",
+        "truncated",
+    }:
+        AI_FAILURES_TOTAL.labels(
+            intent=response.intent.value,
+        ).inc()
 
 def extract_comparison_targets(
     question: str,
@@ -414,6 +455,7 @@ async def ask_discovery(
             response=response,
             products=[],
             started_at=started_at,
+
         )
 
         return response
@@ -915,6 +957,7 @@ def contains_prompt_injection(
 async def stream_assistant(
     db: Session,
     *,
+    user_id: uuid.UUID | None = None,
     question: str,
     top_k: int = 5,
     llm: LLMProvider | None = None,
@@ -959,6 +1002,7 @@ async def stream_assistant(
             started_at=started_at,
             status="refused",
             correlation_id=correlation_id,
+            user_id=user_id,
         )
 
         yield {
@@ -1032,6 +1076,7 @@ async def stream_assistant(
                 started_at=started_at,
                 status="refused",
                 correlation_id=correlation_id,
+                user_id=user_id,                
             )
 
             yield {
@@ -1119,6 +1164,7 @@ async def stream_assistant(
                 started_at=started_at,
                 status="refused",
                 correlation_id=correlation_id,
+                user_id=user_id,
             )
 
             yield {
@@ -1172,6 +1218,7 @@ async def stream_assistant(
                 started_at=started_at,
                 status="refused",
                 correlation_id=correlation_id,
+                user_id=user_id,
             )
 
             yield {
@@ -1264,6 +1311,7 @@ async def stream_assistant(
                 started_at=started_at,
                 status="refused",
                 correlation_id=correlation_id,
+                user_id=user_id,
             )
 
             yield {
@@ -1336,6 +1384,7 @@ async def stream_assistant(
                 started_at=started_at,
                 status="refused",
                 correlation_id=correlation_id,
+                user_id=user_id,
             )
 
             yield {
@@ -1448,6 +1497,7 @@ async def stream_assistant(
             output_tokens=output_tokens,
             status="completed",
             correlation_id=correlation_id,
+            user_id=user_id,
         )
 
         persisted = True
@@ -1499,6 +1549,7 @@ async def stream_assistant(
                 output_tokens=output_tokens,
                 status="truncated",
                 correlation_id=correlation_id,
+                user_id=user_id,
             )
 
             logger.warning(
@@ -1507,8 +1558,10 @@ async def stream_assistant(
 
         raise
 
-    except Exception:
-        # Persist a partial answer if the provider itself fails.
+    except AIProviderUnavailableError as exc:
+        # The external provider failed or timed out.
+        # Persist the partial response, then finish the SSE stream
+        # cleanly instead of abruptly closing the HTTP connection.
         if not persisted:
             partial_answer = "".join(
                 answer_parts
@@ -1534,10 +1587,77 @@ async def stream_assistant(
                 output_tokens=output_tokens,
                 status="failed",
                 correlation_id=correlation_id,
+                user_id=user_id,
+            )
+
+        logger.exception(
+            "AI provider unavailable"
+        )
+
+        yield {
+            "type": "error",
+            "code": exc.error_code,
+            "message": exc.message,
+        }
+
+        yield {
+            "type": "done",
+            "status": "failed",
+            "model": provider.model_name,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+
+        return
+
+    except Exception:
+        # Unexpected AI pipeline failure.
+        if not persisted:
+            partial_answer = "".join(
+                answer_parts
+            )
+
+            response = AssistantResponse(
+                question=question,
+                answer=partial_answer,
+                intent=intent,
+                citations=citations,
+                refused=False,
+                prompt_version=prompt_version,
+                model=provider.model_name,
+            )
+
+            _persist_interaction(
+                db,
+                question=question,
+                response=response,
+                products=products,
+                started_at=started_at,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                status="failed",
+                correlation_id=correlation_id,
+                user_id=user_id,
             )
 
         logger.exception(
             "AI stream failed"
         )
 
-        raise
+        yield {
+            "type": "error",
+            "code": "ai_request_failed",
+            "message": (
+                "The AI request could not be completed."
+            ),
+        }
+
+        yield {
+            "type": "done",
+            "status": "failed",
+            "model": provider.model_name,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+
+        return

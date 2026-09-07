@@ -70,6 +70,19 @@ def _assert_can_edit(
             "You do not own this product"
         )
 
+def assert_can_edit(
+    product: Product,
+    user: User,
+) -> None:
+    """
+    Public ownership check for services that need to verify whether
+    a user may modify or generate content for this product.
+    """
+
+    _assert_can_edit(
+        product,
+        user,
+    )
 
 # task 2.1 - updated in 4.9
 def _assert_can_publish(product: Product) -> None:

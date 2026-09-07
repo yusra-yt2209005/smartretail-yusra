@@ -53,14 +53,29 @@ class Settings(BaseSettings):
         # --- Week 5: LLM ---
 
     # Which text-generation implementation to use.
-    # "fake" is the safe default for local development/tests.
+    # --- Week 5: LLM ---
+
     llm_provider: str = "fake"
 
-    # Used only when the real OpenAI provider is selected.
-    llm_model: str = "gpt-5.6-luna"
+    llm_model: str = "openai/gpt-oss-20b"
+
+    groq_api_key: str = ""
+
+    groq_base_url: str = (
+        "https://api.groq.com/openai/v1"
+    )
+
 
     # Maximum time allowed for one provider request.
     llm_timeout_seconds: float = 30.0
+        # Number of automatic retries for transient provider failures.
+    llm_max_retries: int = 2
+        # --- Week 5: AI cache + rate limiting ---
+
+    ai_rate_limit_requests: int = 20
+    ai_rate_limit_window_seconds: int = 60
+
+    ai_answer_cache_ttl_seconds: int = 60
 
 
 # Instantiated once at import time and reused everywhere (a singleton).
