@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete
 
 from app.db.session import SessionLocal
-from app.main import app
+from app.main import app ## ERRO ON THIS LINE
 from app.models.category import Category
 from app.models.product import Product
 from app.models.user import User

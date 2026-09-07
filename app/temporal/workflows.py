@@ -17,6 +17,7 @@ with workflow.unsafe.imports_passed_through():
         build_catalog_activity,
         cancel_order_activity,
         chunk_product_activity,
+        embed_product_chunks_activity,
         confirm_order_activity,
         create_shipment_activity,
         mark_product_publish_failed_activity,
@@ -29,6 +30,8 @@ with workflow.unsafe.imports_passed_through():
         reserve_inventory_activity,
         validate_product_activity,
     )
+
+
 
 DEFAULT_TIMEOUT = timedelta(seconds=30)
 
@@ -147,9 +150,23 @@ class ProductPublishingWorkflow:
                 ),
                 retry_policy=DEFAULT_RETRY,
             )
-
             # ---------------------------------------------------------
-            # 5. Mark publishing successful
+            # 5. Generate and store embeddings
+            # ---------------------------------------------------------
+            self._step = "embedding"
+
+            embedding_result = await workflow.execute_activity(
+                embed_product_chunks_activity,
+                ProductIdInput(
+                    product_id=product_id,
+                ),
+                start_to_close_timeout=timedelta(
+                    seconds=60
+                ),
+                retry_policy=DEFAULT_RETRY,
+            )
+            # ---------------------------------------------------------
+            # 6. Mark publishing successful
             # ---------------------------------------------------------
             self._step = "publishing"
 
@@ -168,6 +185,7 @@ class ProductPublishingWorkflow:
                 "product_id": product_id,
                 "status": "published",
                 **chunk_result,
+                **embedding_result,
             }
 
         except Exception as exc:

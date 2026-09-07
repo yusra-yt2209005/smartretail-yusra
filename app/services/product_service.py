@@ -71,18 +71,21 @@ def _assert_can_edit(
         )
 
 
-# task 2.1
+# task 2.1 - updated in 4.9
 def _assert_can_publish(product: Product) -> None:
     """
-    Validate whether a publish action may be started.
+    Validate whether a publish/re-publish action may be started.
 
     Publishing may start from:
-    - DRAFT: first publish attempt
-    - PUBLISH_FAILED: retry after a failed publish workflow
+    - DRAFT: first publish
+    - PUBLISH_FAILED: retry after failure
+    - PUBLISHED: re-index after product/price/stock changes
     """
+
     allowed_statuses = {
         ProductStatus.DRAFT,
         ProductStatus.PUBLISH_FAILED,
+        ProductStatus.PUBLISHED,
     }
 
     if product.status not in allowed_statuses:
@@ -430,6 +433,7 @@ def begin_product_publish(
     Legal transitions:
         DRAFT -> PUBLISHING
         PUBLISH_FAILED -> PUBLISHING
+        PUBLISHED -> PUBLISHING
     """
     product = get_product(
         db,

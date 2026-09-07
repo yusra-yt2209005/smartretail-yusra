@@ -99,6 +99,7 @@ async def main() -> None:
                 activities.process_media_activity,
                 activities.build_catalog_activity,
                 activities.chunk_product_activity,
+                activities.embed_product_chunks_activity,
                 activities.mark_product_published_activity,
                 activities.mark_product_publish_failed_activity,
 

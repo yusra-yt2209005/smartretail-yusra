@@ -591,12 +591,20 @@ def test_publish_while_already_publishing_returns_409(client):
     assert response.json()["error"]["code"] == "conflict"
 
 
-def test_publish_while_already_published_returns_409(client):
+def test_published_product_can_be_republished(
+    client,
+    fake_temporal,
+):
     """
-    A successfully published product cannot be published again.
+    PUBLISHED products may be re-published so Week 4 can refresh
+    chunks, vector metadata and embeddings after catalog changes.
     """
 
-    token, product_id = create_status_test_product(client)
+    token, product_id = (
+        create_status_test_product(
+            client
+        )
+    )
 
     set_product_status_in_db(
         product_id,
@@ -606,12 +614,34 @@ def test_publish_while_already_published_returns_409(client):
     response = client.post(
         f"/products/{product_id}/publish",
         headers={
-            "Authorization": f"Bearer {token}"
+            "Authorization": (
+                f"Bearer {token}"
+            )
         },
     )
 
-    assert response.status_code == 409
-    assert response.json()["error"]["code"] == "conflict"
+    assert response.status_code == 202
+
+    body = response.json()
+
+    assert body["status"] == "publishing"
+
+    with SessionLocal() as db:
+        product = db.get(
+            Product,
+            uuid.UUID(product_id),
+        )
+
+        assert product is not None
+
+        assert (
+            product.status
+            == ProductStatus.PUBLISHING
+        )
+
+    assert len(
+        fake_temporal.started_workflows
+    ) == 1
 
 
 def test_publish_failed_product_can_retry(

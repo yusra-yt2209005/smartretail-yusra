@@ -369,6 +369,18 @@ services:
     depends_on:
       - api
     restart: unless-stopped
+
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    container_name: app-grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
 # ---------------------------------------------------------------------------
 # YOUR services go here. Sketch for reference — you write the real ones,
 # along with the Dockerfile they use.
@@ -405,3 +417,4 @@ volumes:
   redis_data:
   kafka_data:
   prometheus_data:
+  grafana_data:
